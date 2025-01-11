@@ -1,8 +1,9 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::collections::{BTreeMap, HashMap};
 
 use super::*;
+use crate::planner::RecExpr;
 
 /// The catalog of a table.
 pub struct TableCatalog {
@@ -12,11 +13,15 @@ pub struct TableCatalog {
     column_idxs: HashMap<String, ColumnId>,
     columns: BTreeMap<ColumnId, ColumnCatalog>,
 
-    #[allow(dead_code)]
-    is_materialized_view: bool,
+    kind: TableKind,
     next_column_id: ColumnId,
-    #[allow(dead_code)]
-    ordered_pk_ids: Vec<ColumnId>,
+    primary_key: Vec<ColumnId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TableKind {
+    Table,
+    View(RecExpr),
 }
 
 impl TableCatalog {
@@ -24,22 +29,40 @@ impl TableCatalog {
         id: TableId,
         name: String,
         columns: Vec<ColumnCatalog>,
-        is_materialized_view: bool,
-        ordered_pk_ids: Vec<ColumnId>,
+        primary_key: Vec<ColumnId>,
+    ) -> TableCatalog {
+        Self::new_(id, name, columns, TableKind::Table, primary_key)
+    }
+
+    pub fn new_view(
+        id: TableId,
+        name: String,
+        columns: Vec<ColumnCatalog>,
+        query: RecExpr,
+    ) -> TableCatalog {
+        Self::new_(id, name, columns, TableKind::View(query), vec![])
+    }
+
+    fn new_(
+        id: TableId,
+        name: String,
+        columns: Vec<ColumnCatalog>,
+        kind: TableKind,
+        primary_key: Vec<ColumnId>,
     ) -> TableCatalog {
         let mut table_catalog = TableCatalog {
             id,
             name,
             column_idxs: HashMap::new(),
             columns: BTreeMap::new(),
-            is_materialized_view,
+            kind,
             next_column_id: 0,
-            ordered_pk_ids,
+            primary_key,
         };
         table_catalog
             .add_column(ColumnCatalog::new(
                 u32::MAX,
-                DataTypeKind::Int64.not_null().to_column("_rowid_".into()),
+                ColumnDesc::new("_rowid_", DataType::Int64, false),
             ))
             .unwrap();
         for col_catalog in columns {
@@ -49,10 +72,7 @@ impl TableCatalog {
         table_catalog
     }
 
-    pub(in crate::catalog) fn add_column(
-        &mut self,
-        col_catalog: ColumnCatalog,
-    ) -> Result<ColumnId, CatalogError> {
+    fn add_column(&mut self, col_catalog: ColumnCatalog) -> Result<ColumnId, CatalogError> {
         if self.column_idxs.contains_key(col_catalog.name()) {
             return Err(CatalogError::Duplicated(
                 "column",
@@ -96,8 +116,8 @@ impl TableCatalog {
             .cloned()
     }
 
-    pub fn name(&self) -> String {
-        self.name.clone()
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn id(&self) -> TableId {
@@ -105,7 +125,19 @@ impl TableCatalog {
     }
 
     pub fn primary_keys(&self) -> Vec<ColumnId> {
-        self.ordered_pk_ids.clone()
+        self.primary_key.clone()
+    }
+
+    pub fn is_view(&self) -> bool {
+        matches!(self.kind, TableKind::View(_))
+    }
+
+    /// Returns the query if it is a view.
+    pub fn query(&self) -> Option<&RecExpr> {
+        match &self.kind {
+            TableKind::Table => None,
+            TableKind::View(query) => Some(query),
+        }
     }
 }
 
@@ -115,11 +147,11 @@ mod tests {
 
     #[test]
     fn test_table_catalog() {
-        let col0 = ColumnCatalog::new(0, DataTypeKind::Int32.not_null().to_column("a".into()));
-        let col1 = ColumnCatalog::new(1, DataTypeKind::Bool.not_null().to_column("b".into()));
+        let col0 = ColumnCatalog::new(0, ColumnDesc::new("a", DataType::Int32, false));
+        let col1 = ColumnCatalog::new(1, ColumnDesc::new("b", DataType::Bool, false));
 
         let col_catalogs = vec![col0, col1];
-        let table_catalog = TableCatalog::new(0, "t".into(), col_catalogs, false, vec![]);
+        let table_catalog = TableCatalog::new(0, "t".into(), col_catalogs, vec![]);
 
         assert!(!table_catalog.contains_column("c"));
         assert!(table_catalog.contains_column("a"));
@@ -130,10 +162,10 @@ mod tests {
 
         let col0_catalog = table_catalog.get_column_by_id(0).unwrap();
         assert_eq!(col0_catalog.name(), "a");
-        assert_eq!(col0_catalog.datatype().kind(), DataTypeKind::Int32);
+        assert_eq!(col0_catalog.data_type(), DataType::Int32);
 
         let col1_catalog = table_catalog.get_column_by_id(1).unwrap();
         assert_eq!(col1_catalog.name(), "b");
-        assert_eq!(col1_catalog.datatype().kind(), DataTypeKind::Bool);
+        assert_eq!(col1_catalog.data_type(), DataType::Bool);
     }
 }

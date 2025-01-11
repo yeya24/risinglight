@@ -1,6 +1,6 @@
-use std::iter::IntoIterator;
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
-use itertools::Itertools;
+use std::iter::IntoIterator;
 
 use super::{ArrayBuilderImpl, DataChunk};
 use crate::types::{ConvertError, DataType, DataValue};
@@ -26,6 +26,16 @@ impl DataChunkBuilder {
         }
     }
 
+    /// Create a [`DataChunkBuilder`] with unbounded capacity.
+    pub fn unbounded<'a>(data_types: impl IntoIterator<Item = &'a DataType>) -> Self {
+        let array_builders = data_types.into_iter().map(ArrayBuilderImpl::new).collect();
+        DataChunkBuilder {
+            array_builders,
+            size: 0,
+            capacity: usize::MAX,
+        }
+    }
+
     /// Push a row in the Iterator.
     ///
     /// The row is accepted as an iterator of [`DataValue`], and it's required that the size of row
@@ -37,7 +47,7 @@ impl DataChunkBuilder {
     pub fn push_row(&mut self, row: impl IntoIterator<Item = DataValue>) -> Option<DataChunk> {
         self.array_builders
             .iter_mut()
-            .zip_eq(row)
+            .zip(row)
             .for_each(|(builder, v)| builder.push(&v));
         self.size += 1;
         if self.size == self.capacity {
@@ -60,7 +70,7 @@ impl DataChunkBuilder {
         &mut self,
         row: impl IntoIterator<Item = &'a str>,
     ) -> Result<Option<DataChunk>, ConvertError> {
-        for (builder, r) in self.array_builders.iter_mut().zip_eq(row) {
+        for (builder, r) in self.array_builders.iter_mut().zip(row) {
             builder.push_str(r)?
         }
 
@@ -86,7 +96,9 @@ impl DataChunkBuilder {
                     .iter_mut()
                     .map(|builder| {
                         let chunk = builder.take();
-                        builder.reserve(capacity);
+                        if capacity != usize::MAX {
+                            builder.reserve(capacity);
+                        }
                         chunk
                     })
                     .collect(),

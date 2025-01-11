@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use async_recursion::async_recursion;
 use enum_dispatch::enum_dispatch;
@@ -17,6 +17,7 @@ pub enum SecondaryIterator {
 }
 
 #[enum_dispatch(SecondaryIterator)]
+#[allow(dead_code)]
 pub trait SecondaryIteratorImpl {}
 
 /// An iterator over all data in a transaction.

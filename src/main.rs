@@ -1,10 +1,9 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 //! A simple interactive shell of the database.
 
-#![feature(div_duration)]
-
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,13 +12,15 @@ use async_trait::async_trait;
 use clap::Parser;
 use humantime::format_duration;
 use itertools::Itertools;
-use minitrace::prelude::*;
 use risinglight::array::{datachunk_to_sqllogictest_string, Chunk};
+use risinglight::server::run_server;
 use risinglight::storage::SecondaryStorageOptions;
 use risinglight::utils::time::RoundingDuration;
 use risinglight::Database;
 use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
 use rustyline::Editor;
+use sqllogictest::DefaultColumnType;
 use tokio::{select, signal};
 use tracing::{info, warn, Level};
 use tracing_subscriber::prelude::*;
@@ -28,13 +29,14 @@ use tracing_subscriber::prelude::*;
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
+    /// The name of an RisingLight database.
+    /// A new database is created if the file does not previously exist.
+    #[clap(default_value = ":memory:")]
+    filename: String,
+
     /// File to execute. Can be either a SQL `sql` file or sqllogictest `slt` file.
     #[clap(short, long)]
     file: Option<String>,
-
-    /// Whether to use in-memory engine
-    #[clap(long)]
-    memory: bool,
 
     /// Control the output format
     /// - `text`: plain text
@@ -49,6 +51,20 @@ struct Args {
     /// Whether to use tokio console.
     #[clap(long)]
     tokio_console: bool,
+
+    /// Start the postgres server instead of the interactive shell.
+    #[clap(long)]
+    server: bool,
+    /// The host to bind to.
+    /// Defaults to localhost.
+    /// Ignored if --server is not set.
+    #[clap(long)]
+    host: Option<String>,
+    /// The port to listen on.
+    /// Default to 5432.
+    /// Ignored if `--server` is not specified.
+    #[clap(long)]
+    port: Option<u16>,
 }
 
 // human-readable message
@@ -103,31 +119,15 @@ fn print_execution_time(start_time: Instant) {
     }
 }
 
-async fn run_query_in_background(
-    db: Arc<Database>,
-    sql: String,
-    output_format: Option<String>,
-    enable_tracing: bool,
-) {
+async fn run_query_in_background(db: Arc<Database>, sql: String, output_format: Option<String>) {
     let start_time = Instant::now();
-    let task = async move {
-        if enable_tracing {
-            let (root, collector) = Span::root("root");
-            let result = db.run(&sql).in_span(root).await;
-            let records: Vec<SpanRecord> = collector.collect().await;
-            println!("{records:#?}");
-            result
-        } else {
-            db.run(&sql).await
-        }
-    };
 
     select! {
         _ = signal::ctrl_c() => {
             // we simply drop the future `task` to cancel the query.
             println!("Interrupted");
         }
-        ret = task => {
+        ret = db.run(&sql) => {
             match ret {
                 Ok(chunks) => {
                     for chunk in chunks {
@@ -145,7 +145,7 @@ async fn run_query_in_background(
 ///
 /// Note that `;` in string literals will also be treated as a terminator
 /// as long as it is at the end of a line.
-fn read_sql(rl: &mut Editor<()>) -> Result<String, ReadlineError> {
+fn read_sql(rl: &mut Editor<&Database, DefaultHistory>) -> Result<String, ReadlineError> {
     let mut sql = String::new();
     loop {
         let prompt = if sql.is_empty() { "> " } else { "? " };
@@ -169,12 +169,8 @@ fn read_sql(rl: &mut Editor<()>) -> Result<String, ReadlineError> {
 }
 
 /// Run RisingLight interactive mode
-async fn interactive(
-    db: Database,
-    output_format: Option<String>,
-    enable_tracing: bool,
-) -> Result<()> {
-    let mut rl = Editor::<()>::new()?;
+async fn interactive(db: Database, output_format: Option<String>) -> Result<()> {
+    let mut rl = Editor::<&Database, DefaultHistory>::new()?;
     let history_path = dirs::cache_dir().map(|p| {
         let cache_dir = p.join("risinglight");
         std::fs::create_dir_all(cache_dir.as_path()).ok();
@@ -192,15 +188,15 @@ async fn interactive(
     }
 
     let db = Arc::new(db);
+    rl.set_helper(Some(&db));
 
     loop {
         let read_sql = read_sql(&mut rl);
         match read_sql {
             Ok(sql) => {
                 if !sql.trim().is_empty() {
-                    rl.add_history_entry(sql.as_str());
-                    run_query_in_background(db.clone(), sql, output_format.clone(), enable_tracing)
-                        .await;
+                    rl.add_history_entry(sql.as_str())?;
+                    run_query_in_background(db.clone(), sql, output_format.clone()).await;
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -227,25 +223,12 @@ async fn interactive(
 }
 
 /// Run a SQL file in RisingLight
-async fn run_sql(
-    db: Database,
-    path: &str,
-    output_format: Option<String>,
-    enable_tracing: bool,
-) -> Result<()> {
+async fn run_sql(db: Database, path: &str, output_format: Option<String>) -> Result<()> {
     let lines = std::fs::read_to_string(path)?;
 
     info!("{}", lines);
 
-    let chunks = if enable_tracing {
-        let (root, collector) = Span::root("root");
-        let chunk = db.run(&lines).in_span(root).await?;
-        let records: Vec<SpanRecord> = collector.collect().await;
-        println!("{records:#?}");
-        chunk
-    } else {
-        db.run(&lines).await?
-    };
+    let chunks = db.run(&lines).await?;
 
     for chunk in chunks {
         print_chunk(&chunk, &output_format);
@@ -258,14 +241,17 @@ async fn run_sql(
 struct DatabaseWrapper {
     db: Database,
     output_format: Option<String>,
-    enable_tracing: bool,
 }
 
 #[async_trait]
-impl sqllogictest::AsyncDB for DatabaseWrapper {
+impl sqllogictest::AsyncDB for &DatabaseWrapper {
+    type ColumnType = DefaultColumnType;
     type Error = risinglight::Error;
-    async fn run(&mut self, sql: &str) -> Result<sqllogictest::DBOutput, Self::Error> {
-        use sqllogictest::{ColumnType, DBOutput};
+    async fn run(
+        &mut self,
+        sql: &str,
+    ) -> Result<sqllogictest::DBOutput<DefaultColumnType>, Self::Error> {
+        use sqllogictest::DBOutput;
 
         let is_query_sql = {
             let lower_sql = sql.trim_start().to_ascii_lowercase();
@@ -277,15 +263,7 @@ impl sqllogictest::AsyncDB for DatabaseWrapper {
         };
 
         info!("{}", sql);
-        let chunks = if self.enable_tracing {
-            let (root, collector) = Span::root("root");
-            let chunk = self.db.run(sql).in_span(root).await?;
-            let records: Vec<SpanRecord> = collector.collect().await;
-            println!("{records:#?}");
-            chunk
-        } else {
-            self.db.run(sql).await?
-        };
+        let chunks = self.db.run(sql).await?;
 
         for chunk in &chunks {
             print_chunk(chunk, &self.output_format);
@@ -301,7 +279,7 @@ impl sqllogictest::AsyncDB for DatabaseWrapper {
                 return Ok(DBOutput::StatementComplete(0));
             }
         }
-        let types = vec![ColumnType::Any; chunks[0].get_first_data_chunk().column_count()];
+        let types = vec![DefaultColumnType::Any; chunks[0].get_first_data_chunk().column_count()];
         let rows = chunks
             .iter()
             .flat_map(datachunk_to_sqllogictest_string)
@@ -311,17 +289,9 @@ impl sqllogictest::AsyncDB for DatabaseWrapper {
 }
 
 /// Run a sqllogictest file in RisingLight
-async fn run_sqllogictest(
-    db: Database,
-    path: &str,
-    output_format: Option<String>,
-    enable_tracing: bool,
-) -> Result<()> {
-    let mut tester = sqllogictest::Runner::new(DatabaseWrapper {
-        db,
-        output_format,
-        enable_tracing,
-    });
+async fn run_sqllogictest(db: Database, path: &str, output_format: Option<String>) -> Result<()> {
+    let db = DatabaseWrapper { db, output_format };
+    let mut tester = sqllogictest::Runner::new(|| async { Ok(&db) });
     let path = path.to_string();
 
     tester
@@ -348,29 +318,35 @@ async fn main() -> Result<()> {
             .with(fmt_layer)
             .init();
     }
+    if args.enable_tracing {
+        use minitrace::collector::{Config, ConsoleReporter};
+        minitrace::set_reporter(ConsoleReporter, Config::default());
+    }
 
-    info!("using query engine v2. type '\\v1' to use the legacy engine");
-
-    let db = if args.memory {
-        info!("using memory engine");
+    let db = if args.filename == ":memory:" {
+        info!("Connected to a transient in-memory database.");
         Database::new_in_memory()
     } else {
-        info!("using Secondary engine");
-        Database::new_on_disk(SecondaryStorageOptions::default_for_cli()).await
+        let mut options = SecondaryStorageOptions::default_for_cli();
+        options.path = PathBuf::new().join(args.filename);
+        Database::new_on_disk(options).await
     };
 
     if let Some(file) = args.file {
         if file.ends_with(".sql") {
-            run_sql(db, &file, args.output_format, args.enable_tracing).await?;
+            run_sql(db, &file, args.output_format).await?;
         } else if file.ends_with(".slt") {
-            run_sqllogictest(db, &file, args.output_format, args.enable_tracing).await?;
+            run_sqllogictest(db, &file, args.output_format).await?;
         } else {
             warn!("No suffix detected, assume sql file");
-            run_sql(db, &file, args.output_format, args.enable_tracing).await?;
+            run_sql(db, &file, args.output_format).await?;
         }
+    } else if args.server {
+        run_server(args.host, args.port, db).await;
     } else {
-        interactive(db, args.output_format, args.enable_tracing).await?;
+        interactive(db, args.output_format).await?;
     }
 
+    minitrace::flush();
     Ok(())
 }

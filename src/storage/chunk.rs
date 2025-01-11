@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use bitvec::prelude::BitVec;
 use smallvec::SmallVec;
@@ -86,7 +86,7 @@ impl StorageChunk {
             Some(visibility) => DataChunk::from_iter(
                 self.arrays
                     .iter()
-                    .map(|a| a.filter(visibility.iter().map(|x| *x))),
+                    .map(|a| a.filter(&visibility.iter().map(|x| *x).collect::<Vec<bool>>())),
             ),
             None => DataChunk::from_iter(self.arrays),
         }
