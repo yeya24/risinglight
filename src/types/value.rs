@@ -1,3 +1,5 @@
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
+
 use num_traits::ToPrimitive;
 use ordered_float::OrderedFloat;
 use parse_display::Display;
@@ -18,13 +20,15 @@ pub enum DataValue {
     #[display("{0}")]
     Bool(bool),
     #[display("{0}")]
+    Int16(i16),
+    #[display("{0}")]
     Int32(i32),
     #[display("{0}")]
     Int64(i64),
     #[display("{0}")]
     Float64(F64),
     #[display("'{0}'")]
-    String(String),
+    String(Str),
     #[display("{0}")]
     Blob(Blob),
     #[display("{0}")]
@@ -32,7 +36,15 @@ pub enum DataValue {
     #[display("{0}")]
     Date(Date),
     #[display("{0}")]
+    Timestamp(Timestamp),
+    #[display("{0}")]
+    TimestampTz(TimestampTz),
+    #[display("{0}")]
     Interval(Interval),
+    /// Vector is a specialized array type for floating point numbers. In the future, it will be
+    /// replaced by Array.
+    #[display("{0}")]
+    Vector(Vector),
 }
 
 /// memory table row type
@@ -41,6 +53,7 @@ pub type Row = Vec<DataValue>;
 /// A wrapper around floats providing implementations of `Eq`, `Ord`, and `Hash`.
 pub type F32 = OrderedFloat<f32>;
 pub type F64 = OrderedFloat<f64>;
+pub type Str = Box<str>;
 
 macro_rules! impl_arith_for_datavalue {
     ($Trait:ident, $name:ident) => {
@@ -103,6 +116,7 @@ impl DataValue {
         match self {
             Self::Null => false,
             Self::Bool(v) => *v,
+            Self::Int16(v) => v.is_positive(),
             Self::Int32(v) => v.is_positive(),
             Self::Int64(v) => v.is_positive(),
             Self::Float64(v) => v.0.is_sign_positive(),
@@ -110,7 +124,10 @@ impl DataValue {
             Self::Blob(_) => false,
             Self::Decimal(v) => v.is_sign_positive(),
             Self::Date(_) => false,
+            Self::Timestamp(_) => false,
+            Self::TimestampTz(_) => false,
             Self::Interval(v) => v.is_positive(),
+            Self::Vector(_) => false,
         }
     }
 
@@ -119,6 +136,7 @@ impl DataValue {
         match self {
             Self::Null => false,
             Self::Bool(v) => !*v,
+            Self::Int16(v) => *v == 0,
             Self::Int32(v) => *v == 0,
             Self::Int64(v) => *v == 0,
             Self::Float64(v) => v.0 == 0.0,
@@ -126,23 +144,30 @@ impl DataValue {
             Self::Blob(_) => false,
             Self::Decimal(v) => v.is_zero(),
             Self::Date(_) => false,
+            Self::Timestamp(_) => false,
+            Self::TimestampTz(_) => false,
             Self::Interval(v) => v.is_zero(),
+            Self::Vector(_) => false,
         }
     }
 
     /// Get the type of value.
     pub fn data_type(&self) -> DataType {
         match self {
-            Self::Null => DataTypeKind::Null.nullable(),
-            Self::Bool(_) => DataTypeKind::Bool.not_null(),
-            Self::Int32(_) => DataTypeKind::Int32.not_null(),
-            Self::Int64(_) => DataTypeKind::Int64.not_null(),
-            Self::Float64(_) => DataTypeKind::Float64.not_null(),
-            Self::String(_) => DataTypeKind::String.not_null(),
-            Self::Blob(_) => DataTypeKind::Blob.not_null(),
-            Self::Decimal(_) => DataTypeKind::Decimal(None, None).not_null(),
-            Self::Date(_) => DataTypeKind::Date.not_null(),
-            Self::Interval(_) => DataTypeKind::Interval.not_null(),
+            Self::Null => DataType::Null,
+            Self::Bool(_) => DataType::Bool,
+            Self::Int16(_) => DataType::Int16,
+            Self::Int32(_) => DataType::Int32,
+            Self::Int64(_) => DataType::Int64,
+            Self::Float64(_) => DataType::Float64,
+            Self::String(_) => DataType::String,
+            Self::Blob(_) => DataType::Blob,
+            Self::Decimal(_) => DataType::Decimal(None, None),
+            Self::Date(_) => DataType::Date,
+            Self::Timestamp(_) => DataType::Timestamp,
+            Self::TimestampTz(_) => DataType::TimestampTz,
+            Self::Interval(_) => DataType::Interval,
+            Self::Vector(vec) => DataType::Vector(vec.len()),
         }
     }
 
@@ -152,6 +177,7 @@ impl DataValue {
         Ok(Some(match self {
             Self::Null => return Ok(None),
             &Self::Bool(b) => b as usize,
+            &Self::Int16(v) => v.try_into().map_err(|_| cast_err())?,
             &Self::Int32(v) => v.try_into().map_err(|_| cast_err())?,
             &Self::Int64(v) => v.try_into().map_err(|_| cast_err())?,
             &Self::Float64(f) if f.is_sign_negative() => return Err(cast_err()),
@@ -159,14 +185,25 @@ impl DataValue {
             &Self::Decimal(d) if d.is_sign_negative() => return Err(cast_err()),
             &Self::Decimal(d) => d.to_usize().ok_or_else(cast_err)?,
             &Self::Date(_) => return Err(cast_err()),
+            &Self::Timestamp(_) => return Err(cast_err()),
+            &Self::TimestampTz(_) => return Err(cast_err()),
             &Self::Interval(_) => return Err(cast_err()),
             Self::String(s) => s.parse::<usize>().map_err(|_| cast_err())?,
             Self::Blob(_) => return Err(cast_err()),
+            Self::Vector(_) => return Err(cast_err()),
         }))
     }
 
+    /// Get the string value.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::String(s) => s,
+            _ => panic!("not a string: {:?}", self),
+        }
+    }
+
     /// Cast the value to another type.
-    pub fn cast(&self, ty: &DataTypeKind) -> Result<Self, ConvertError> {
+    pub fn cast(&self, ty: &DataType) -> Result<Self, ConvertError> {
         Ok(ArrayImpl::from(self).cast(ty)?.get(0))
     }
 }
@@ -178,7 +215,7 @@ macro_rules! impl_min_max {
         impl From<Option<&$Type>> for DataValue {
             fn from(v: Option<&$Type>) -> Self {
                 match v {
-                    Some(v) => Self::$Value(v.to_owned()),
+                    Some(v) => Self::$Value(v.to_owned().into()),
                     None => Self::Null,
                 }
             }
@@ -219,6 +256,12 @@ impl From<Option<&()>> for DataValue {
     }
 }
 
+impl From<String> for DataValue {
+    fn from(v: String) -> Self {
+        Self::String(v.into())
+    }
+}
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum ParseValueError {
     #[error("invalid interval: {0}")]
@@ -246,7 +289,7 @@ impl FromStr for DataValue {
         } else if let Ok(d) = s.parse::<Decimal>() {
             Ok(Self::Decimal(d))
         } else if s.starts_with('\'') && s.ends_with('\'') {
-            Ok(Self::String(s[1..s.len() - 1].to_string()))
+            Ok(Self::String(s[1..s.len() - 1].into()))
         } else if s.starts_with("b\'") && s.ends_with('\'') {
             Ok(Self::Blob(s[2..s.len() - 1].parse()?))
         } else if let Some(s) = s.strip_prefix("interval") {

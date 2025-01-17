@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::hash::Hash;
 
@@ -6,11 +6,8 @@ use bytes::{Buf, BufMut};
 use ordered_float::OrderedFloat;
 use rust_decimal::Decimal;
 
-use crate::array::{
-    Array, BlobArray, BoolArray, DateArray, DecimalArray, F64Array, I32Array, I64Array,
-    IntervalArray, Utf8Array,
-};
-use crate::types::{BlobRef, Date, Interval, F64};
+use crate::array::*;
+use crate::types::{BlobRef, Date, Interval, Timestamp, TimestampTz, F64};
 
 /// Encode a primitive value into fixed-width buffer
 pub trait PrimitiveFixedWidthEncode:
@@ -40,6 +37,21 @@ impl PrimitiveFixedWidthEncode for bool {
 
     fn decode(buffer: &mut impl Buf) -> Self {
         buffer.get_u8() != 0
+    }
+}
+
+impl PrimitiveFixedWidthEncode for i16 {
+    const WIDTH: usize = std::mem::size_of::<i16>();
+    const DEFAULT_VALUE: &'static i16 = &0;
+
+    type ArrayType = I16Array;
+
+    fn encode(&self, buffer: &mut impl BufMut) {
+        buffer.put_i16_le(*self);
+    }
+
+    fn decode(buffer: &mut impl Buf) -> Self {
+        buffer.get_i16_le()
     }
 }
 
@@ -118,6 +130,35 @@ impl PrimitiveFixedWidthEncode for Date {
     }
 }
 
+impl PrimitiveFixedWidthEncode for Timestamp {
+    const WIDTH: usize = std::mem::size_of::<i64>();
+    const DEFAULT_VALUE: &'static Self = &Timestamp::new(0);
+
+    type ArrayType = TimestampArray;
+
+    fn encode(&self, buffer: &mut impl BufMut) {
+        buffer.put_i64(self.get_inner());
+    }
+
+    fn decode(buffer: &mut impl Buf) -> Self {
+        Timestamp::new(buffer.get_i64())
+    }
+}
+
+impl PrimitiveFixedWidthEncode for TimestampTz {
+    const WIDTH: usize = std::mem::size_of::<i64>();
+    const DEFAULT_VALUE: &'static Self = &TimestampTz::new(0);
+    type ArrayType = TimestampTzArray;
+
+    fn encode(&self, buffer: &mut impl BufMut) {
+        buffer.put_i64(self.get_inner());
+    }
+
+    fn decode(buffer: &mut impl Buf) -> Self {
+        TimestampTz::new(buffer.get_i64())
+    }
+}
+
 impl PrimitiveFixedWidthEncode for Interval {
     const WIDTH: usize = std::mem::size_of::<i32>() + std::mem::size_of::<i32>();
     const DEFAULT_VALUE: &'static Self = &Interval::from_days(0);
@@ -165,7 +206,7 @@ impl BlobEncode for BlobRef {
 }
 
 impl BlobEncode for str {
-    type ArrayType = Utf8Array;
+    type ArrayType = StringArray;
 
     fn len(&self) -> usize {
         self.len()

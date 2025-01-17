@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::borrow::Borrow;
 
@@ -9,7 +9,7 @@ use risinglight_proto::rowset::BlockStatistics;
 use super::BlockBuilder;
 use crate::array::Array;
 
-// Copyright 2022 tokio. Licensed under Apache-2.0
+// Copyright 2023 tokio. Licensed under Apache-2.0
 /// encode u32 to multiple u8
 pub fn encode_32<B>(mut value: u32, buf: &mut B)
 where
@@ -82,7 +82,7 @@ pub fn decode_u32_slice(bytes: &[u8]) -> Result<(u32, usize), DecodeError> {
     };
     Err(DecodeError::new("invalid varint"))
 }
-// Copyright 2022 tokio. Licensed under Apache-2.0
+// Copyright 2023 tokio. Licensed under Apache-2.0
 
 /// Encodes fixed-width data into a block with run-length encoding. The layout is
 /// rle counts and data from other block builder
@@ -194,7 +194,7 @@ mod tests {
         PlainPrimitiveBlockBuilder,
     };
     use super::*;
-    use crate::array::{I32Array, Utf8Array};
+    use crate::array::{I32Array, StringArray};
 
     #[test]
     fn test_build_rle_primitive_i32() {
@@ -265,7 +265,7 @@ mod tests {
     fn test_build_rle_char() {
         // Test rle block builder for char
         let builder = PlainCharBlockBuilder::new(120, 40);
-        let mut rle_builder = RleBlockBuilder::<Utf8Array, PlainCharBlockBuilder>::new(builder);
+        let mut rle_builder = RleBlockBuilder::<StringArray, PlainCharBlockBuilder>::new(builder);
 
         let width_40_char = ["2"].iter().cycle().take(40).join("");
 
@@ -290,7 +290,7 @@ mod tests {
         // Test rle block builder for varchar
         let builder = PlainBlobBlockBuilder::new(30);
         let mut rle_builder =
-            RleBlockBuilder::<Utf8Array, PlainBlobBlockBuilder<str>>::new(builder);
+            RleBlockBuilder::<StringArray, PlainBlobBlockBuilder<str>>::new(builder);
         for item in [Some("233")].iter().cycle().cloned().take(30) {
             rle_builder.append(item);
         }

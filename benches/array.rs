@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use bitvec::vec::BitVec;
 use criterion::*;
@@ -7,8 +7,7 @@ use risinglight::array::{
     ArrayFromDataExt, ArrayImpl, BoolArray, DecimalArray, F64Array, I32Array,
 };
 use risinglight::parser::BinaryOperator;
-use risinglight::types::DataTypeKind;
-use risinglight::v1::function::FunctionCtx;
+use risinglight::types::DataType;
 use rust_decimal::Decimal;
 
 fn ops(c: &mut Criterion) {
@@ -39,12 +38,17 @@ fn ops(c: &mut Criterion) {
     }
 
     for_all_size(c, "and(bool,bool)", |b, &size| {
-        let a1: ArrayImpl = (0..size).map(|i| i % 2 == 0).collect::<BoolArray>().into();
-        let a2: ArrayImpl = a1.clone();
+        let a1: ArrayImpl = make_bool_array(size);
+        let a2: ArrayImpl = make_bool_array(size);
         b.iter(|| a1.and(&a2));
     });
+    for_all_size(c, "or(bool,bool)", |b, &size| {
+        let a1: ArrayImpl = make_bool_array(size);
+        let a2: ArrayImpl = make_bool_array(size);
+        b.iter(|| a1.or(&a2));
+    });
     for_all_size(c, "not(bool)", |b, &size| {
-        let a1: ArrayImpl = (0..size).map(|i| i % 2 == 0).collect::<BoolArray>().into();
+        let a1: ArrayImpl = make_bool_array(size);
         b.iter(|| a1.not());
     });
 }
@@ -79,80 +83,41 @@ fn agg(c: &mut Criterion) {
 fn cast(c: &mut Criterion) {
     for_all_size(c, "cast(i32->f64)", |b, &size| {
         let a1 = make_i32_array(size);
-        b.iter(|| a1.cast(&DataTypeKind::Float64))
+        b.iter(|| a1.cast(&DataType::Float64))
     });
     for_all_size(c, "cast(f64->decimal)", |b, &size| {
         let a1 = make_f64_array(size);
-        b.iter(|| a1.cast(&DataTypeKind::Decimal(None, None)))
+        b.iter(|| a1.cast(&DataType::Decimal(None, None)))
     });
-    for_all_size(c, "cast(i32->string)", |b, &size| {
+    for ty in ["i32", "f64", "decimal"] {
+        for_all_size(c, format!("cast({ty}->string)"), |b, &size| {
+            let a1 = match ty {
+                "i32" => make_i32_array(size),
+                "f64" => make_f64_array(size),
+                "decimal" => make_decimal_array(size),
+                _ => unreachable!(),
+            };
+            b.iter(|| a1.cast(&DataType::String))
+        });
+    }
+}
+
+fn filter(c: &mut Criterion) {
+    for_all_size(c, "filter(i32)", |b, &size| {
         let a1 = make_i32_array(size);
-        b.iter(|| a1.cast(&DataTypeKind::String))
+        let ArrayImpl::Bool(a2) = make_bool_array(size) else {
+            unreachable!()
+        };
+        b.iter(|| a1.filter(a2.true_array()))
     });
 }
 
-fn function(c: &mut Criterion) {
-    for_all_size(c, "array mul function (standard)", |b, &size| {
-        use risinglight::v1::function::BinaryExecutor;
-        let a1 = make_i32_array(size);
-        let a2 = make_i32_array(size);
-        let f = |x: &i32, y: &i32, _: &mut FunctionCtx| (*x) * (*y);
-        b.iter(|| {
-            let _ =
-                BinaryExecutor::eval_batch_standard::<I32Array, I32Array, I32Array, _>(&a1, &a2, f);
-        });
-    });
-
-    for_all_size(
-        c,
-        "array mul function (standard + never inline)",
-        |b, &size| {
-            use risinglight::v1::function::BinaryExecutor;
-            let a1 = make_i32_array(size);
-            let a2 = make_i32_array(size);
-            b.iter(|| {
-                let _ = BinaryExecutor::eval_batch_standard::<I32Array, I32Array, I32Array, _>(
-                    &a1,
-                    &a2,
-                    never_inline_mul,
-                );
-            });
-        },
-    );
-
-    for_all_size(c, "array mul function (lazy select)", |b, &size| {
-        use risinglight::v1::function::BinaryExecutor;
-        let a1 = make_i32_array(size);
-        let a2 = make_i32_array(size);
-        let f = |x: &i32, y: &i32, _: &mut FunctionCtx| (*x) * (*y);
-        b.iter(|| {
-            let _ = BinaryExecutor::eval_batch_lazy_select::<I32Array, I32Array, I32Array, _>(
-                &a1, &a2, f,
-            );
-        });
-    });
-
-    for_all_size(
-        c,
-        "array mul function (lazy select + never inline)",
-        |b, &size| {
-            use risinglight::v1::function::BinaryExecutor;
-            let a1 = make_i32_array(size);
-            let a2 = make_i32_array(size);
-            b.iter(|| {
-                let _ = BinaryExecutor::eval_batch_lazy_select::<I32Array, I32Array, I32Array, _>(
-                    &a1,
-                    &a2,
-                    never_inline_mul,
-                );
-            });
-        },
-    );
-
-    #[inline(never)]
-    fn never_inline_mul(a: &i32, b: &i32, _: &mut FunctionCtx) -> i32 {
-        *a * *b
-    }
+fn make_bool_array(size: usize) -> ArrayImpl {
+    let mask = make_valid_bitmap(size);
+    let iter = (0..size as i32)
+        .zip(mask.clone())
+        .map(|(i, v)| if v { i % 2 == 0 } else { false });
+    BoolArray::from_data(iter, mask).into()
 }
 
 fn make_i32_array(size: usize) -> ArrayImpl {
@@ -199,11 +164,11 @@ fn for_all_size(
 ) {
     let mut group = c.benchmark_group(name);
     group.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
-    for size in [1, 16, 256, 4096, 65536] {
+    for size in [1, 16, 256, 4096] {
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, &mut f);
     }
     group.finish();
 }
 
-criterion_group!(benches, function, ops, agg, cast);
+criterion_group!(benches, ops, agg, cast, filter);
 criterion_main!(benches);

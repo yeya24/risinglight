@@ -20,7 +20,9 @@ After that, the table will be created, and the table information will be stored 
 
 ```plain
 > \dt
-| 0 | postgres | 0 | postgres | 18 | t |
+| 0 | postgres   | 0 | users        |
+| 0 | postgres   | 1 | t            |
+| 1 | pg_catalog | 0 | contributors |
 ```
 
 ## Parser
@@ -120,8 +122,8 @@ The binder will figure out some basic information like which tables do each vari
 Select(
   BoundSelect {
     select_list: [
-      Column #ColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 0 },
-      Sum([Column #ColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 1 }]) -> Int32 (nullable) (agg),
+      Column #BaseTableColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 0 },
+      Sum([Column #BaseTableColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 1 }]) -> Int32 (nullable) (agg),
     ],
     from_table: Some(
       JoinTableRef {
@@ -152,7 +154,7 @@ Select(
     where_clause: None,
     select_distinct: false,
     group_by: [
-      Column #ColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 0 },
+      Column #BaseTableColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 0 },
     ],
   },
 )
@@ -173,22 +175,22 @@ In database systems, there are a lot of logical operators. Here we list some:
 * Join: join results from two executors. For example, `select * from a inner join b`.
 * ...
 
-The logical planner will do some simple mappings from bound statements to logical plans, so as to have a basic sketch of how this query will be processed. See [`src/logical_planner`](../src/logical_planner) for more information.
+The logical planner will do some simple mappings from bound statements to logical plans, so as to have a basic sketch of how this query will be processed. See [`src/planner`](../src/planner) for more information.
 
 The example SQL will have the following logical plan, which is a simple DAG: `Projection <- Aggregate <- TableScan`.
 
 ```rust
 LogicalProjection {
   project_expressions: [
-    Column #ColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 0 },
+    Column #BaseTableColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 0 },
     InputRef #1,
   ],
   child: LogicalAggregate {
     agg_calls: [
-      Sum([Column #ColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 1 }]) -> Int32 (nullable),
+      Sum([Column #BaseTableColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 1 }]) -> Int32 (nullable),
     ],
     group_keys: [
-      Column #ColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 0 },
+      Column #BaseTableColumnRefId { database_id: 0, schema_id: 0, table_id: 18, column_id: 0 },
     ],
     child: LogicalTableScan {
       table_ref_id: 0.0.18,
@@ -249,7 +251,7 @@ Another example is the *filter scan* rule. In RisingLight, the storage layer sup
 
 The *filter scan* rule will automatically merge a filter plan node and a table scan node, apply the filter condition to the table scan node, and produce a single `TableScan` node.
 
-In a nutshell, in RisingLight, the optimizer will transform while optimizing the logical plan into a physical plan. See [`src/optimizer`](../src/optimizer) for more information. The example SQL will produce the following physical plan: `PhysicalProjection <- PhysicalHashAgg <- PhysicalTableScan`. Note that as physical nodes have almost identical information to logical nodes, we store information of logical nodes inside physical nodes as `logical` variable. Despite their existence inside physical plans, after all, the following tree only contain physical nodes.
+In a nutshell, in RisingLight, the optimizer will transform while optimizing the logical plan into a physical plan. See [`src/optimizer`](../src/planner/optimizer.rs) for more information. The example SQL will produce the following physical plan: `PhysicalProjection <- PhysicalHashAgg <- PhysicalTableScan`. Note that as physical nodes have almost identical information to logical nodes, we store information of logical nodes inside physical nodes as `logical` variable. Despite their existence inside physical plans, after all, the following tree only contain physical nodes.
 
 ```rust
 PhysicalProjection {
@@ -314,6 +316,6 @@ That's the end of the lifecycle of a SQL query in RisingLight. To summarize,
 * Optimizer: Do query optimization and generate physical plans.
 * Executor: Execute the queries.
 
-Looking for some challenges in RisingLight? Just pick some [good first issues](https://github.com/risinglightdb/risinglight/issues) and follow the [contribution guide](../CONTRIBUTING.md). Also welcome to join our Slack community, please refer to [readme](../README.md) for more information.
+Looking for some challenges in RisingLight? Just pick some [good first issues](https://github.com/risinglightdb/risinglight/issues) and follow the [contribution guide](../CONTRIBUTING.md).
 
 The RisingLight storage is also interesting to learn. [An Overview of RisingLight Storage](04-storage-overview.md) will give more insights on it.

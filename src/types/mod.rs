@@ -1,30 +1,37 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::hash::Hash;
 use std::num::ParseIntError;
 use std::str::FromStr;
 
 use parse_display::Display;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlparser::ast::TimezoneInfo;
 
 mod blob;
 mod date;
 mod interval;
 mod native;
+mod timestamp;
 mod value;
+mod vector;
 
 pub use self::blob::*;
 pub use self::date::*;
 pub use self::interval::*;
 pub use self::native::*;
+pub use self::timestamp::*;
 pub use self::value::*;
+pub use self::vector::*;
 
 /// Data type.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum DataTypeKind {
+pub enum DataType {
     // NOTE: order matters
     Null,
     Bool,
+    Int16,
     Int32,
     Int64,
     // Float32,
@@ -32,13 +39,16 @@ pub enum DataTypeKind {
     // decimal (precision, scale)
     Decimal(Option<u8>, Option<u8>),
     Date,
+    Timestamp,
+    TimestampTz,
     Interval,
     String,
     Blob,
     Struct(Vec<DataType>),
+    Vector(usize),
 }
 
-impl DataTypeKind {
+impl DataType {
     pub const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
@@ -46,19 +56,25 @@ impl DataTypeKind {
     pub const fn is_number(&self) -> bool {
         matches!(
             self,
-            Self::Int32 | Self::Int64 | Self::Float64 | Self::Decimal(_, _)
+            Self::Int16 | Self::Int32 | Self::Int64 | Self::Float64 | Self::Decimal(_, _)
         )
+    }
+
+    pub const fn is_parametric_decimal(&self) -> bool {
+        matches!(self, Self::Decimal(Some(_), _) | Self::Decimal(_, Some(_)))
     }
 
     /// Returns the inner types of the struct.
     pub fn as_struct(&self) -> &[DataType] {
-        let Self::Struct(types) = self else { panic!("not a struct: {self}") };
+        let Self::Struct(types) = self else {
+            panic!("not a struct: {self}")
+        };
         types
     }
 
     /// Returns the minimum compatible type of 2 types.
     pub fn union(&self, other: &Self) -> Option<Self> {
-        use DataTypeKind::*;
+        use DataType::*;
         let (a, b) = if self <= other {
             (self, other)
         } else {
@@ -89,17 +105,18 @@ impl DataTypeKind {
     }
 }
 
-impl From<&crate::parser::DataType> for DataTypeKind {
+impl From<&crate::parser::DataType> for DataType {
     fn from(kind: &crate::parser::DataType) -> Self {
         use sqlparser::ast::ExactNumberInfo;
 
         use crate::parser::DataType::*;
         match kind {
-            Char(_) | Varchar(_) | String => Self::String,
+            Char(_) | Varchar(_) | String(_) | Text => Self::String,
             Bytea | Binary(_) | Varbinary(_) | Blob(_) => Self::Blob,
             // Real => Self::Float32,
             Float(_) | Double => Self::Float64,
-            Int(_) => Self::Int32,
+            SmallInt(_) => Self::Int16,
+            Int(_) | Integer(_) => Self::Int32,
             BigInt(_) => Self::Int64,
             Boolean => Self::Bool,
             Decimal(info) => match info {
@@ -110,16 +127,29 @@ impl From<&crate::parser::DataType> for DataTypeKind {
                 }
             },
             Date => Self::Date,
+            Timestamp(_, TimezoneInfo::None) => Self::Timestamp,
+            Timestamp(_, TimezoneInfo::Tz) => Self::TimestampTz,
             Interval => Self::Interval,
+            Custom(name, items) => {
+                if name.to_string().to_lowercase() == "vector" {
+                    if items.len() != 1 {
+                        panic!("must specify length for vector");
+                    }
+                    Self::Vector(items[0].parse().unwrap())
+                } else {
+                    todo!("not supported type: {:?}", kind)
+                }
+            }
             _ => todo!("not supported type: {:?}", kind),
         }
     }
 }
 
-impl std::fmt::Display for DataTypeKind {
+impl std::fmt::Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Null => write!(f, "NULL"),
+            Self::Int16 => write!(f, "SMALLINT"),
             Self::Int32 => write!(f, "INT"),
             Self::Int64 => write!(f, "BIGINT"),
             // Self::Float32 => write!(f, "REAL"),
@@ -134,17 +164,20 @@ impl std::fmt::Display for DataTypeKind {
                 (None, Some(_)) => panic!("invalid decimal"),
             },
             Self::Date => write!(f, "DATE"),
+            Self::Timestamp => write!(f, "TIMESTAMP"),
+            Self::TimestampTz => write!(f, "TIMESTAMP WITH TIME ZONE"),
             Self::Interval => write!(f, "INTERVAL"),
             Self::Struct(types) => {
                 write!(f, "STRUCT(")?;
                 for t in types.iter().take(1) {
-                    write!(f, "{}", t.kind())?;
+                    write!(f, "{}", t)?;
                 }
                 for t in types.iter().skip(1) {
-                    write!(f, ", {}", t.kind())?;
+                    write!(f, ", {}", t)?;
                 }
                 write!(f, ")")
             }
+            Self::Vector(length) => write!(f, "VECTOR({length})"),
         }
     }
 }
@@ -157,11 +190,11 @@ pub enum ParseTypeError {
     Invalid(String),
 }
 
-impl FromStr for DataTypeKind {
+impl FromStr for DataType {
     type Err = ParseTypeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        use DataTypeKind::*;
+        use DataType::*;
         Ok(match s {
             "INT" => Int32,
             "BIGINT" => Int64,
@@ -188,61 +221,6 @@ impl FromStr for DataTypeKind {
     }
 }
 
-/// Data type with nullable.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct DataType {
-    pub kind: DataTypeKind,
-    pub nullable: bool,
-}
-
-impl std::fmt::Debug for DataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.kind)?;
-        if self.nullable {
-            write!(f, " (nullable)")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::fmt::Display for DataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl DataType {
-    pub fn new(kind: DataTypeKind, nullable: bool) -> DataType {
-        DataType { kind, nullable }
-    }
-
-    pub fn is_nullable(&self) -> bool {
-        self.nullable
-    }
-
-    pub fn kind(&self) -> DataTypeKind {
-        self.kind.clone()
-    }
-
-    /// Returns the minimum compatible type of 2 types.
-    pub fn union(&self, other: &Self) -> Option<Self> {
-        Some(DataType {
-            kind: self.kind.union(&other.kind)?,
-            nullable: self.nullable || other.nullable,
-        })
-    }
-}
-
-impl DataTypeKind {
-    pub fn nullable(self) -> DataType {
-        DataType::new(self, true)
-    }
-
-    pub fn not_null(self) -> DataType {
-        DataType::new(self, false)
-    }
-}
-
 /// The error type of value type convention.
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum ConvertError {
@@ -256,28 +234,36 @@ pub enum ConvertError {
     ParseDecimal(String, #[source] rust_decimal::Error),
     #[error("failed to convert string {0:?} to date: {1}")]
     ParseDate(String, #[source] chrono::ParseError),
+    #[error("failed to convert string {0:?} to timestamp: {1}")]
+    ParseTimestamp(String, #[source] ParseTimestampError),
+    #[error("failed to convert string {0:?} to timestamp with time zone: {1}")]
+    ParseTimestampTz(String, #[source] ParseTimestampError),
     #[error("failed to convert string {0:?} to interval: {1}")]
     ParseInterval(String, #[source] ParseIntervalError),
     #[error("failed to convert string {0:?} to blob: {1}")]
     ParseBlob(String, #[source] ParseBlobError),
+    #[error("failed to convert string {0:?} to vector: {1}")]
+    ParseVector(String, #[source] ParseVectorError),
     #[error("failed to convert {0} to decimal")]
     ToDecimalError(DataValue),
     #[error("failed to convert {0} from decimal {1}")]
-    FromDecimalError(DataTypeKind, DataValue),
+    FromDecimalError(DataType, Decimal),
     #[error("failed to convert {0} from date")]
-    FromDateError(DataTypeKind),
+    FromDateError(DataType),
     #[error("failed to convert {0} from interval")]
-    FromIntervalError(DataTypeKind),
+    FromIntervalError(DataType),
     #[error("failed to cast {0} to type {1}")]
     Cast(String, &'static str),
     #[error("constant {0} overflows {1}")]
-    Overflow(DataValue, DataTypeKind),
+    Overflow(DataValue, DataType),
     #[error("no function {0}({1})")]
     NoUnaryOp(String, &'static str),
     #[error("no function {0}({1}, {2})")]
     NoBinaryOp(String, &'static str, &'static str),
+    #[error("no function {0}({1}, {2}, {3})")]
+    NoTernaryOp(String, &'static str, &'static str, &'static str),
     #[error("no cast {0} -> {1}")]
-    NoCast(&'static str, DataTypeKind),
+    NoCast(&'static str, DataType),
 }
 
 /// The physical index to the column from child plan.

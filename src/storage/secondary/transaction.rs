@@ -1,6 +1,7 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -18,9 +19,8 @@ use super::{
 use crate::array::DataChunk;
 use crate::catalog::find_sort_key_id;
 use crate::storage::secondary::statistics::create_statistics_global_aggregator;
-use crate::storage::{StorageColumnRef, StorageResult, Transaction};
+use crate::storage::{ScanOptions, StorageColumnRef, StorageResult, Transaction};
 use crate::types::DataValue;
-use crate::v1::binder::BoundExpr;
 
 /// A transaction running on `SecondaryStorage`.
 pub struct SecondaryTransaction {
@@ -218,14 +218,10 @@ impl SecondaryTransaction {
 
     async fn scan_inner(
         &self,
-        begin_keys: &[DataValue],
-        end_keys: &[DataValue],
         col_idx: &[StorageColumnRef],
-        is_sorted: bool,
-        reversed: bool,
-        expr: Option<BoundExpr>,
+        opts: ScanOptions,
     ) -> StorageResult<SecondaryTableTxnIterator> {
-        assert!(!reversed, "reverse iterator is not supported for now");
+        assert!(!opts.reversed, "reverse iterator is not supported for now");
 
         let mut iters: Vec<RowSetIterator> = vec![];
 
@@ -244,17 +240,17 @@ impl SecondaryTransaction {
                     })
                     .unwrap_or_default();
 
+                let begin_keys = match &opts.filter {
+                    Some(range) => match &range.start {
+                        Bound::Included(k) | Bound::Excluded(k) => Some(k),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 let start_rowid = rowset.start_rowid(begin_keys).await;
                 iters.push(
                     rowset
-                        .iter(
-                            col_idx.into(),
-                            dvs,
-                            start_rowid,
-                            expr.clone(),
-                            begin_keys,
-                            end_keys,
-                        )
+                        .iter(col_idx.into(), dvs, start_rowid, opts.filter.clone())
                         .await?,
                 )
             }
@@ -262,16 +258,24 @@ impl SecondaryTransaction {
 
         let final_iter = if iters.len() == 1 {
             iters.pop().unwrap().into()
-        } else if is_sorted {
-            let sort_key = find_sort_key_id(&self.table.columns);
-            if let Some(sort_key) = sort_key {
-                let real_col_idx = col_idx.iter().position(|x| match x {
-                    StorageColumnRef::Idx(y) => *y as usize == sort_key,
-                    _ => false,
-                });
+        } else if opts.is_sorted {
+            let sort_keys = find_sort_key_id(&self.table.columns);
+            if !sort_keys.is_empty() {
+                let real_col_idx = sort_keys
+                    .iter()
+                    .map(|id| {
+                        col_idx
+                            .iter()
+                            .position(|x| match x {
+                                StorageColumnRef::Idx(y) => *y as usize == *id,
+                                _ => false,
+                            })
+                            .expect("sorting key not in column list")
+                    })
+                    .collect_vec();
                 MergeIterator::new(
                     iters.into_iter().map(|iter| iter.into()).collect_vec(),
-                    vec![real_col_idx.expect("sort key not in column list")],
+                    real_col_idx,
                 )
                 .into()
             } else {
@@ -353,22 +357,10 @@ impl Transaction for SecondaryTransaction {
 
     async fn scan(
         &self,
-        begin_sort_key: &[DataValue],
-        end_sort_key: &[DataValue],
         col_idx: &[StorageColumnRef],
-        is_sorted: bool,
-        reversed: bool,
-        expr: Option<BoundExpr>,
+        options: ScanOptions,
     ) -> StorageResult<SecondaryTableTxnIterator> {
-        self.scan_inner(
-            begin_sort_key,
-            end_sort_key,
-            col_idx,
-            is_sorted,
-            reversed,
-            expr,
-        )
-        .await
+        self.scan_inner(col_idx, options).await
     }
 
     async fn append(&mut self, columns: DataChunk) -> StorageResult<()> {

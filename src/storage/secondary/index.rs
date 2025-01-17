@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
 
@@ -39,12 +39,12 @@ impl ColumnIndex {
             ));
         }
         let length = footer.get_u64() as usize;
-        let checksum_type = ChecksumType::from_i32(footer.get_i32())
-            .ok_or_else(|| TracedStorageError::decode("invalid checksum type"))?;
+        let checksum_type = ChecksumType::try_from(footer.get_i32())
+            .map_err(|_| TracedStorageError::decode("invalid checksum type"))?;
         let checksum = footer.get_u64();
         verify_checksum(checksum_type, index_data, checksum)?;
 
-        let mut indexes = vec![];
+        let mut indexes = Vec::with_capacity(length);
         for _ in 0..length {
             let index = BlockIndex::decode_length_delimited(&mut index_data)?;
             indexes.push(index);

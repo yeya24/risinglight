@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -59,11 +59,11 @@ impl InMemoryTxnIterator {
                     .map(|idx| match idx {
                         StorageColumnRef::Idx(idx) => selected_chunk
                             .array_at(*idx as usize)
-                            .filter(visibility.iter().map(|x| *x)),
+                            .filter(&visibility.iter().map(|x| *x).collect::<Vec<bool>>()),
                         StorageColumnRef::RowHandler => ArrayImpl::new_int64(I64Array::from_iter(
                             batch_range.clone().map(|x| x as i64),
                         ))
-                        .filter(visibility.iter().map(|x| *x)),
+                        .filter(&visibility.iter().map(|x| *x).collect::<Vec<bool>>()),
                     })
                     .collect::<DataChunk>()
             };

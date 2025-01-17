@@ -1,14 +1,12 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
-use std::borrow::Borrow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use itertools::Itertools;
 use moka::future::Cache;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncReadExt;
+use tokio::fs::{read, OpenOptions};
 
 use super::super::{Block, BlockCacheKey, Column, ColumnIndex, ColumnSeekPosition, IOBackend};
 use super::{path_of_data_column, path_of_index_column, RowSetIterator};
@@ -16,9 +14,8 @@ use crate::catalog::ColumnCatalog;
 use crate::storage::secondary::column::ColumnReadableFile;
 use crate::storage::secondary::encode::PrimitiveFixedWidthEncode;
 use crate::storage::secondary::DeleteVector;
-use crate::storage::{StorageColumnRef, StorageResult};
+use crate::storage::{KeyRange, StorageColumnRef, StorageResult};
 use crate::types::DataValue;
-use crate::v1::binder::BoundExpr;
 
 /// Represents a column in Secondary.
 ///
@@ -44,15 +41,8 @@ impl DiskRowset {
 
             let index_content = match &io_backend {
                 IOBackend::NormalRead | IOBackend::PositionedRead => {
-                    let mut index = OpenOptions::default()
-                        .read(true)
-                        .write(false)
-                        .open(path_of_index_column)
-                        .await?;
-
                     // TODO(chi): add an index cache later
-                    let mut index_content = vec![];
-                    index.read_to_end(&mut index_content).await?;
+                    let index_content = read(&path_of_index_column).await?;
                     Bytes::from(index_content)
                 }
                 IOBackend::InMemory(map) => {
@@ -126,20 +116,9 @@ impl DiskRowset {
         column_refs: Arc<[StorageColumnRef]>,
         dvs: Vec<Arc<DeleteVector>>,
         seek_pos: ColumnSeekPosition,
-        expr: Option<BoundExpr>,
-        begin_keys: &[DataValue],
-        end_keys: &[DataValue],
+        filter: Option<KeyRange>,
     ) -> StorageResult<RowSetIterator> {
-        RowSetIterator::new(
-            self.clone(),
-            column_refs,
-            dvs,
-            seek_pos,
-            expr,
-            begin_keys,
-            end_keys,
-        )
-        .await
+        RowSetIterator::new(self.clone(), column_refs, dvs, seek_pos, filter).await
     }
 
     pub fn on_disk_size(&self) -> u64 {
@@ -159,14 +138,12 @@ impl DiskRowset {
     /// If `begin_key` is greater than all blocks' `first_key`, we return the `first_key` of the
     /// last block.
     /// Todo: support multi sort-keys range filter
-    pub async fn start_rowid(&self, begin_keys: &[DataValue]) -> ColumnSeekPosition {
-        if begin_keys.is_empty() {
+    pub async fn start_rowid(&self, begin_key: Option<&DataValue>) -> ColumnSeekPosition {
+        let Some(begin_key) = begin_key else {
             return ColumnSeekPosition::RowId(0);
-        }
+        };
 
-        // for now, we only use the first column to get the start row id, which means the length
-        // of `begin_keys` can only be 0 or 1.
-        let begin_key = begin_keys[0].borrow();
+        // for now, we only use the first column to get the start row id
         let column = self.column(0);
         let column_index = column.index();
 
@@ -193,43 +170,21 @@ impl DiskRowset {
 
 #[cfg(test)]
 pub mod tests {
-    use std::borrow::Borrow;
-
     use tempfile::TempDir;
 
     use super::*;
     use crate::array::ArrayImpl;
+    use crate::catalog::ColumnDesc;
     use crate::storage::secondary::rowset::rowset_builder::RowsetBuilder;
     use crate::storage::secondary::rowset::RowsetWriter;
     use crate::storage::secondary::{ColumnBuilderOptions, EncodeType};
-    use crate::types::DataTypeKind;
+    use crate::types::DataType;
 
     pub async fn helper_build_rowset(tempdir: &TempDir, nullable: bool, len: usize) -> DiskRowset {
         let columns = vec![
-            ColumnCatalog::new(
-                0,
-                if nullable {
-                    DataTypeKind::Int32.nullable().to_column("v1".to_string())
-                } else {
-                    DataTypeKind::Int32.not_null().to_column("v1".to_string())
-                },
-            ),
-            ColumnCatalog::new(
-                1,
-                if nullable {
-                    DataTypeKind::Int32.nullable().to_column("v2".to_string())
-                } else {
-                    DataTypeKind::Int32.not_null().to_column("v2".to_string())
-                },
-            ),
-            ColumnCatalog::new(
-                2,
-                if nullable {
-                    DataTypeKind::Int32.nullable().to_column("v3".to_string())
-                } else {
-                    DataTypeKind::Int32.not_null().to_column("v3".to_string())
-                },
-            ),
+            ColumnCatalog::new(0, ColumnDesc::new("v1", DataType::Int32, nullable)),
+            ColumnCatalog::new(1, ColumnDesc::new("v2", DataType::Int32, nullable)),
+            ColumnCatalog::new(2, ColumnDesc::new("v3", DataType::Int32, nullable)),
         ];
 
         let mut builder = RowsetBuilder::new(
@@ -278,11 +233,7 @@ pub mod tests {
     ) -> DiskRowset {
         let columns = vec![ColumnCatalog::new(
             0,
-            if nullable {
-                DataTypeKind::Int32.nullable().to_column("v1".to_string())
-            } else {
-                DataTypeKind::Int32.not_null().to_column("v1".to_string())
-            },
+            ColumnDesc::new("v1", DataType::Int32, nullable),
         )];
         let mut column_options = ColumnBuilderOptions::default_for_test();
         column_options.encode_type = EncodeType::RunLength;
@@ -321,11 +272,7 @@ pub mod tests {
     ) -> DiskRowset {
         let columns = vec![ColumnCatalog::new(
             0,
-            if nullable {
-                DataTypeKind::Int32.nullable().to_column("v1".to_string())
-            } else {
-                DataTypeKind::Int32.not_null().to_column("v1".to_string())
-            },
+            ColumnDesc::new("v1", DataType::Int32, nullable),
         )];
         let mut column_options = ColumnBuilderOptions::default_for_test();
         column_options.encode_type = EncodeType::Dictionary;
@@ -359,20 +306,9 @@ pub mod tests {
 
     pub async fn helper_build_rowset_with_first_key_recorded(tempdir: &TempDir) -> DiskRowset {
         let columns = vec![
-            ColumnCatalog::new(
-                0,
-                DataTypeKind::Int32
-                    .not_null()
-                    .to_column_primary_key("v1".to_string()),
-            ),
-            ColumnCatalog::new(
-                1,
-                DataTypeKind::Int32.not_null().to_column("v2".to_string()),
-            ),
-            ColumnCatalog::new(
-                2,
-                DataTypeKind::Int32.not_null().to_column("v3".to_string()),
-            ),
+            ColumnCatalog::new(0, ColumnDesc::new("v1", DataType::Int32, false)),
+            ColumnCatalog::new(1, ColumnDesc::new("v2", DataType::Int32, false)),
+            ColumnCatalog::new(2, ColumnDesc::new("v3", DataType::Int32, false)),
         ];
 
         let mut builder = RowsetBuilder::new(
@@ -429,18 +365,16 @@ pub mod tests {
     async fn test_get_start_id() {
         let tempdir = tempfile::tempdir().unwrap();
         let rowset = helper_build_rowset_with_first_key_recorded(&tempdir).await;
-        let start_keys = vec![DataValue::Int32(222)];
 
         {
-            let start_rid = match rowset.start_rowid(start_keys.borrow()).await {
+            let start_rid = match rowset.start_rowid(Some(&DataValue::Int32(222))).await {
                 ColumnSeekPosition::RowId(x) => x,
                 _ => panic!("Unable to reach the branch"),
             };
             assert_eq!(start_rid, 196_u32);
         }
         {
-            let start_keys = vec![DataValue::Int32(10000)];
-            let start_rid = match rowset.start_rowid(start_keys.borrow()).await {
+            let start_rid = match rowset.start_rowid(Some(&DataValue::Int32(10000))).await {
                 ColumnSeekPosition::RowId(x) => x,
                 _ => panic!("Unable to reach the branch"),
             };
