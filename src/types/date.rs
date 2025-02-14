@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -24,6 +24,19 @@ impl Date {
     /// Get the inner value of date type
     pub fn get_inner(&self) -> i32 {
         self.0
+    }
+
+    pub fn year(&self) -> i32 {
+        let date = NaiveDate::from_num_days_from_ce_opt(self.0 + UNIX_EPOCH_DAYS).unwrap();
+        date.year()
+    }
+    pub fn month(&self) -> i32 {
+        let date = NaiveDate::from_num_days_from_ce_opt(self.0 + UNIX_EPOCH_DAYS).unwrap();
+        date.month() as i32
+    }
+    pub fn day(&self) -> i32 {
+        let date = NaiveDate::from_num_days_from_ce_opt(self.0 + UNIX_EPOCH_DAYS).unwrap();
+        date.day() as i32
     }
 }
 
@@ -128,5 +141,55 @@ impl Display for Date {
                 .unwrap()
                 .format("%Y-%m-%d")
         )
+    }
+}
+
+#[derive(Debug, parse_display::Display, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[display("{0}")]
+pub struct DateTimeField(pub sqlparser::ast::DateTimeField);
+
+impl From<sqlparser::ast::DateTimeField> for DateTimeField {
+    fn from(field: sqlparser::ast::DateTimeField) -> Self {
+        DateTimeField(field)
+    }
+}
+
+impl FromStr for DateTimeField {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use sqlparser::ast::DateTimeField::*;
+        Ok(Self(match s {
+            "YEAR" => Year,
+            "MONTH" => Month,
+            "WEEK" => Week(None),
+            "DAY" => Day,
+            "DATE" => Date,
+            "HOUR" => Hour,
+            "MINUTE" => Minute,
+            "SECOND" => Second,
+            "CENTURY" => Century,
+            "DECADE" => Decade,
+            "DOW" => Dow,
+            "DOY" => Doy,
+            "EPOCH" => Epoch,
+            "ISODOW" => Isodow,
+            "ISOYEAR" => Isoyear,
+            "JULIAN" => Julian,
+            "MICROSECOND" => Microsecond,
+            "MICROSECONDS" => Microseconds,
+            "MILLENIUM" => Millenium,
+            "MILLENNIUM" => Millennium,
+            "MILLISECOND" => Millisecond,
+            "MILLISECONDS" => Milliseconds,
+            "NANOSECOND" => Nanosecond,
+            "NANOSECONDS" => Nanoseconds,
+            "QUARTER" => Quarter,
+            "TIMEZONE" => Timezone,
+            "TIMEZONE_HOUR" => TimezoneHour,
+            "TIMEZONE_MINUTE" => TimezoneMinute,
+            "NODATETIME" => NoDateTime,
+            _ => return Err(()),
+        }))
     }
 }

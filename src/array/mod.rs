@@ -1,8 +1,7 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::convert::TryFrom;
 use std::fmt::Debug;
-use std::iter::TrustedLen;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -12,26 +11,29 @@ use rust_decimal::prelude::FromStr;
 use rust_decimal::Decimal;
 
 use crate::types::{
-    Blob, ConvertError, DataType, DataTypeKind, DataValue, Date, Interval, F32, F64,
+    Blob, ConvertError, DataType, DataValue, Date, Interval, Timestamp, TimestampTz, Vector, F32,
+    F64,
 };
 
+mod chunked_array;
 mod data_chunk;
 mod data_chunk_builder;
-mod iterator;
 pub mod ops;
 mod primitive_array;
-mod utf8_array;
+mod var_array;
 
+pub use self::chunked_array::*;
 pub use self::data_chunk::*;
 pub use self::data_chunk_builder::*;
-pub use self::iterator::ArrayIter;
 pub use self::primitive_array::*;
-pub use self::utf8_array::*;
+pub use self::var_array::*;
 
 mod internal_ext;
+
 pub use internal_ext::*;
 
 mod shuffle_ext;
+
 pub use shuffle_ext::*;
 
 /// A trait over all array builders.
@@ -39,7 +41,7 @@ pub use shuffle_ext::*;
 /// `ArrayBuilder` is a trait over all builders. You could build an array with
 /// `push` with the help of `ArrayBuilder` trait. The `push` function always
 /// accepts reference to an element. e.g. for `PrimitiveArray`,
-/// you must do `builder.push(Some(&1))`. For `Utf8Array`, you must do
+/// you must do `builder.push(Some(&1))`. For `StringArray`, you must do
 /// `builder.push(Some("xxx"))`. Note that you don't need to construct a `String`.
 ///
 /// The associated type `Array` is the type of the corresponding array. It is the
@@ -93,7 +95,7 @@ pub trait ArrayBuilder: Sized + Send + Sync + 'static {
 /// The `Builder` associated type is the builder for this array.
 /// The `Item` is the item you could retrieve from this array.
 ///
-/// For example, `PrimitiveArray` could return an `Option<&u32>`, and `Utf8Array` will
+/// For example, `PrimitiveArray` could return an `Option<&u32>`, and `StringArray` will
 /// return an `Option<&str>`.
 pub trait Array: Sized + Send + Sync + 'static {
     /// Corresponding builder of this array.
@@ -101,50 +103,56 @@ pub trait Array: Sized + Send + Sync + 'static {
     /// Type of element in the array.
     type Item: ToOwned + ?Sized;
 
-    type RawIter<'a>: Iterator<Item = &'a Self::Item> + TrustedLen;
+    /// Returns true if the value at `idx` is null.
+    fn is_null(&self, idx: usize) -> bool;
 
-    /// Retrieve a reference to value.
-    fn get(&self, idx: usize) -> Option<&Self::Item>;
-
-    fn get_unchecked(&self, idx: usize) -> &Self::Item;
+    /// Returns the raw value at `idx` regardless of null.
+    fn get_raw(&self, idx: usize) -> &Self::Item;
 
     /// Number of items of array.
     fn len(&self) -> usize;
 
+    /// Retrieve a reference to value.
+    fn get(&self, idx: usize) -> Option<&Self::Item> {
+        if self.is_null(idx) {
+            None
+        } else {
+            Some(self.get_raw(idx))
+        }
+    }
+
+    fn filter(&self, p: &[bool]) -> Self;
+
     /// Get iterator of current array.
-    fn iter(&self) -> ArrayIter<'_, Self> {
-        ArrayIter::new(self)
+    fn iter(&self) -> impl DoubleEndedIterator<Item = Option<&Self::Item>> {
+        (0..self.len()).map(|i| self.get(i))
+    }
+
+    /// Get iterator over the raw values.
+    fn raw_iter(&self) -> impl DoubleEndedIterator<Item = &Self::Item> {
+        (0..self.len()).map(|i| self.get_raw(i))
+    }
+
+    /// Get iterator over the non-null values.
+    fn nonnull_iter(&self) -> impl DoubleEndedIterator<Item = &Self::Item> {
+        (0..self.len())
+            .filter(|i| !self.is_null(*i))
+            .map(|i| self.get_raw(i))
     }
 
     /// Check if `Array` is empty.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    fn raw_iter(&self) -> Self::RawIter<'_>;
 }
 
 /// An extension trait for [`Array`].
 pub trait ArrayExt: Array {
-    /// Filter the elements and return a new array.
-    fn filter(&self, visibility: impl Iterator<Item = bool>) -> Self;
-
     /// Return a slice of self for the provided range.
     fn slice(&self, range: impl RangeBounds<usize>) -> Self;
 }
 
 impl<A: Array> ArrayExt for A {
-    /// Filter the elements and return a new array.
-    fn filter(&self, visibility: impl Iterator<Item = bool>) -> Self {
-        let mut builder = Self::Builder::with_capacity(self.len());
-        for (a, visible) in self.iter().zip(visibility) {
-            if visible {
-                builder.push(a);
-            }
-        }
-        builder.finish()
-    }
-
     /// Return a slice of self for the provided range.
     fn slice(&self, range: impl RangeBounds<usize>) -> Self {
         let len = self.len();
@@ -171,12 +179,15 @@ impl<A: Array> ArrayExt for A {
 
 pub type NullArray = PrimitiveArray<()>;
 pub type BoolArray = PrimitiveArray<bool>;
+pub type I16Array = PrimitiveArray<i16>;
 pub type I32Array = PrimitiveArray<i32>;
 pub type I64Array = PrimitiveArray<i64>;
 pub type F32Array = PrimitiveArray<F32>;
 pub type F64Array = PrimitiveArray<F64>;
 pub type DecimalArray = PrimitiveArray<Decimal>;
 pub type DateArray = PrimitiveArray<Date>;
+pub type TimestampArray = PrimitiveArray<Timestamp>;
+pub type TimestampTzArray = PrimitiveArray<TimestampTz>;
 pub type IntervalArray = PrimitiveArray<Interval>;
 
 /// Embeds all types of arrays in `array` module.
@@ -184,41 +195,50 @@ pub type IntervalArray = PrimitiveArray<Interval>;
 pub enum ArrayImpl {
     Null(Arc<NullArray>),
     Bool(Arc<BoolArray>),
-    // Int16(PrimitiveArray<i16>),
+    Int16(Arc<I16Array>),
     Int32(Arc<I32Array>),
     Int64(Arc<I64Array>),
     // Float32(PrimitiveArray<f32>),
     Float64(Arc<F64Array>),
-    Utf8(Arc<Utf8Array>),
+    String(Arc<StringArray>),
     Blob(Arc<BlobArray>),
+    Vector(Arc<VectorArray>),
     Decimal(Arc<DecimalArray>),
     Date(Arc<DateArray>),
+    Timestamp(Arc<TimestampArray>),
+    TimestampTz(Arc<TimestampTzArray>),
     Interval(Arc<IntervalArray>),
 }
 
 pub type NullArrayBuilder = PrimitiveArrayBuilder<()>;
 pub type BoolArrayBuilder = PrimitiveArrayBuilder<bool>;
+pub type I16ArrayBuilder = PrimitiveArrayBuilder<i16>;
 pub type I32ArrayBuilder = PrimitiveArrayBuilder<i32>;
 pub type I64ArrayBuilder = PrimitiveArrayBuilder<i64>;
 pub type F32ArrayBuilder = PrimitiveArrayBuilder<F32>;
 pub type F64ArrayBuilder = PrimitiveArrayBuilder<F64>;
 pub type DecimalArrayBuilder = PrimitiveArrayBuilder<Decimal>;
 pub type DateArrayBuilder = PrimitiveArrayBuilder<Date>;
+pub type TimestampArrayBuilder = PrimitiveArrayBuilder<Timestamp>;
+pub type TimestampTzArrayBuilder = PrimitiveArrayBuilder<TimestampTz>;
 pub type IntervalArrayBuilder = PrimitiveArrayBuilder<Interval>;
 
 /// Embeds all types of array builders in `array` module.
 pub enum ArrayBuilderImpl {
     Null(NullArrayBuilder),
     Bool(BoolArrayBuilder),
-    // Int16(PrimitiveArrayBuilder<i16>),
+    Int16(I16ArrayBuilder),
     Int32(I32ArrayBuilder),
     Int64(I64ArrayBuilder),
     // Float32(PrimitiveArrayBuilder<f32>),
     Float64(F64ArrayBuilder),
-    Utf8(Utf8ArrayBuilder),
+    String(StringArrayBuilder),
     Blob(BlobArrayBuilder),
+    Vector(VectorArrayBuilder),
     Decimal(DecimalArrayBuilder),
     Date(DateArrayBuilder),
+    Timestamp(TimestampArrayBuilder),
+    TimestampTz(TimestampTzArrayBuilder),
     Interval(IntervalArrayBuilder),
 }
 
@@ -237,14 +257,18 @@ macro_rules! for_all_variants {
             [$($x),*],
             { Null, (), null, NullArray, NullArrayBuilder, Null, Null },
             { Bool, bool, bool, BoolArray, BoolArrayBuilder, Bool, Bool },
+            { Int16, i16, int16, I16Array, I16ArrayBuilder, Int16, Int16 },
             { Int32, i32, int32, I32Array, I32ArrayBuilder, Int32, Int32 },
             { Int64, i64, int64, I64Array, I64ArrayBuilder, Int64, Int64 },
             { Float64, F64, float64, F64Array, F64ArrayBuilder, Float64, Float64 },
             { Decimal, Decimal, decimal, DecimalArray, DecimalArrayBuilder, Decimal, Decimal(_, _) },
             { Date, Date, date, DateArray, DateArrayBuilder, Date, Date },
+            { Timestamp, Timestamp, timestamp, TimestampArray, TimestampArrayBuilder, Timestamp, Timestamp },
+            { TimestampTz, TimestampTz, timestamp_tz, TimestampTzArray, TimestampTzArrayBuilder, TimestampTz, TimestampTz },
             { Interval, Interval, interval, IntervalArray, IntervalArrayBuilder, Interval, Interval },
-            { Utf8, str, utf8, Utf8Array, Utf8ArrayBuilder, String, String },
-            { Blob, BlobRef, blob, BlobArray, BlobArrayBuilder, Blob, Blob }
+            { String, str, string, StringArray, StringArrayBuilder, String, String },
+            { Blob, BlobRef, blob, BlobArray, BlobArrayBuilder, Blob, Blob },
+            { Vector, VectorRef, vector, VectorArray, VectorArrayBuilder, Vector, Vector }
         }
     };
 }
@@ -255,14 +279,18 @@ macro_rules! for_all_variants_without_null {
         $macro! {
             [$($x),*],
             { Bool, bool, bool, BoolArray, BoolArrayBuilder, Bool, Bool },
+            { Int16, i16, int16, I16Array, I16ArrayBuilder, Int16, Int16 },
             { Int32, i32, int32, I32Array, I32ArrayBuilder, Int32, Int32 },
             { Int64, i64, int64, I64Array, I64ArrayBuilder, Int64, Int64 },
             { Float64, F64, float64, F64Array, F64ArrayBuilder, Float64, Float64 },
             { Decimal, Decimal, decimal, DecimalArray, DecimalArrayBuilder, Decimal, Decimal(_, _) },
             { Date, Date, date, DateArray, DateArrayBuilder, Date, Date },
+            { Timestamp, Timestamp, timestamp, TimestampArray, TimestampArrayBuilder, Timestamp, Timestamp },
+            { TimestampTz, TimestampTz, timestamp_tz, TimestampTzArray, TimestampTzArrayBuilder, TimestampTz, TimestampTz },
             { Interval, Interval, interval, IntervalArray, IntervalArrayBuilder, Interval, Interval },
-            { Utf8, str, utf8, Utf8Array, Utf8ArrayBuilder, String, String },
-            { Blob, BlobRef, blob, BlobArray, BlobArrayBuilder, Blob, Blob }
+            { String, str, string, StringArray, StringArrayBuilder, String, String },
+            { Blob, BlobRef, blob, BlobArray, BlobArrayBuilder, Blob, Blob },
+            { Vector, VectorRef, vector, VectorArray, VectorArrayBuilder, Vector, Vector(_) }
         }
     };
 }
@@ -368,8 +396,8 @@ macro_rules! impl_array_builder {
 
             /// Create a new array builder with data type
             pub fn with_capacity(capacity: usize, ty: &DataType) -> Self {
-                use DataTypeKind::*;
-                match ty.kind() {
+                use DataType::*;
+                match ty {
                     Null => Self::Null(NullArrayBuilder::with_capacity(capacity)),
                     Struct(_) => todo!("array of Struct type"),
                     $(
@@ -386,7 +414,7 @@ macro_rules! impl_array_builder {
                         (Self::$Abc(a), DataValue::$Value(v)) => a.push(Some(v)),
                         (Self::$Abc(a), DataValue::Null) => a.push(None),
                     )*
-                    _ => panic!("failed to push value: type mismatch"),
+                    (b, v) => panic!("failed to push value: type mismatch. builder: {}, value: {:?}", b.type_string(), v),
                 }
             }
 
@@ -398,7 +426,7 @@ macro_rules! impl_array_builder {
                         (Self::$Abc(a), DataValue::$Value(v)) => a.push_n(n, Some(v)),
                         (Self::$Abc(a), DataValue::Null) => a.push_n(n, None),
                     )*
-                    _ => panic!("failed to push value: type mismatch"),
+                    (b, v) => panic!("failed to push value: type mismatch. builder: {}, value: {:?}", b.type_string(), v),
                 }
             }
 
@@ -429,7 +457,17 @@ macro_rules! impl_array_builder {
                     $(
                         (Self::$Abc(builder), ArrayImpl::$Abc(arr)) => builder.append(arr),
                     )*
-                    _ => panic!("failed to push value: type mismatch"),
+                    (b, a) => panic!("failed to append array: type mismatch. builder: {}, array: {}", b.type_string(), a.type_string()),
+                }
+            }
+
+            /// Return a string describing the type of this array.
+            fn type_string(&self) -> &'static str {
+                match self {
+                    Self::Null(_) => "NULL",
+                    $(
+                        Self::$Abc(_) => stringify!($Abc),
+                    )*
                 }
             }
         }
@@ -450,17 +488,25 @@ impl ArrayBuilderImpl {
         match self {
             Self::Null(a) => a.push(None),
             Self::Bool(a) if null => a.push(None),
+            Self::Int16(a) if null => a.push(None),
             Self::Int32(a) if null => a.push(None),
             Self::Int64(a) if null => a.push(None),
             Self::Float64(a) if null => a.push(None),
-            Self::Utf8(a) if null => a.push(None),
+            Self::String(a) if null => a.push(None),
             Self::Blob(a) if null => a.push(None),
+            Self::Vector(a) if null => a.push(None),
             Self::Decimal(a) if null => a.push(None),
             Self::Date(a) if null => a.push(None),
+            Self::Timestamp(a) if null => a.push(None),
+            Self::TimestampTz(a) if null => a.push(None),
             Self::Interval(a) if null => a.push(None),
             Self::Bool(a) => a.push(Some(
                 &s.parse::<bool>()
                     .map_err(|e| ConvertError::ParseBool(s.to_string(), e))?,
+            )),
+            Self::Int16(a) => a.push(Some(
+                &s.parse::<i16>()
+                    .map_err(|e| ConvertError::ParseInt(s.to_string(), e))?,
             )),
             Self::Int32(a) => a.push(Some(
                 &s.parse::<i32>()
@@ -474,10 +520,14 @@ impl ArrayBuilderImpl {
                 &s.parse::<F64>()
                     .map_err(|e| ConvertError::ParseFloat(s.to_string(), e))?,
             )),
-            Self::Utf8(a) => a.push(Some(s)),
+            Self::String(a) => a.push(Some(s)),
             Self::Blob(a) => a.push(Some(
                 &s.parse::<Blob>()
                     .map_err(|e| ConvertError::ParseBlob(s.to_string(), e))?,
+            )),
+            Self::Vector(a) => a.push(Some(
+                &s.parse::<Vector>()
+                    .map_err(|e| ConvertError::ParseVector(s.to_string(), e))?,
             )),
             Self::Decimal(a) => a.push(Some(
                 &Decimal::from_str(s).map_err(|e| ConvertError::ParseDecimal(s.to_string(), e))?,
@@ -485,6 +535,14 @@ impl ArrayBuilderImpl {
             Self::Date(a) => a.push(Some(
                 &Date::from_str(s).map_err(|e| ConvertError::ParseDate(s.to_string(), e))?,
             )),
+            Self::Timestamp(a) => a
+                .push(Some(&Timestamp::from_str(s).map_err(|e| {
+                    ConvertError::ParseTimestamp(s.to_string(), e)
+                })?)),
+            Self::TimestampTz(a) => a
+                .push(Some(&TimestampTz::from_str(s).map_err(|e| {
+                    ConvertError::ParseTimestampTz(s.to_string(), e)
+                })?)),
             Self::Interval(a) => a.push(Some(
                 &Interval::from_str(s)
                     .map_err(|e| ConvertError::ParseInterval(s.to_string(), e))?,
@@ -529,11 +587,16 @@ macro_rules! impl_array {
                     Self::Null(_) => DataValue::Null,
                     $(
                         Self::$Abc(a) => match a.get(idx) {
-                            Some(val) => DataValue::$Value(val.to_owned()),
+                            Some(val) => DataValue::$Value(val.to_owned().into()),
                             None => DataValue::Null,
                         },
                     )*
                 }
+            }
+
+            /// Get iterator of current array.
+            pub fn iter(&self) -> impl DoubleEndedIterator<Item = DataValue> + '_ {
+                (0..self.len()).map(|i| self.get(i))
             }
 
             /// Number of items of array.
@@ -547,11 +610,11 @@ macro_rules! impl_array {
             }
 
             /// Filter the elements and return a new array.
-            pub fn filter(&self, visibility: impl Iterator<Item = bool>) -> Self {
+            pub fn filter(&self, visibility: &[bool]) -> Self {
                 match self {
-                    Self::Null(a) => Self::Null(a.filter(visibility).into()),
+                    Self::Null(a) => Self::Null(a.filter(&visibility).into()),
                     $(
-                        Self::$Abc(a) => Self::$Abc(a.filter(visibility).into()),
+                        Self::$Abc(a) => Self::$Abc(a.filter(&visibility).into()),
                     )*
                 }
             }
@@ -594,14 +657,18 @@ impl From<&DataValue> for ArrayImpl {
         match val {
             DataValue::Null => Self::new_null([None].into_iter().collect()),
             &DataValue::Bool(v) => Self::new_bool([v].into_iter().collect()),
+            &DataValue::Int16(v) => Self::new_int16([v].into_iter().collect()),
             &DataValue::Int32(v) => Self::new_int32([v].into_iter().collect()),
             &DataValue::Int64(v) => Self::new_int64([v].into_iter().collect()),
             &DataValue::Float64(v) => Self::new_float64([v].into_iter().collect()),
-            DataValue::String(v) => Self::new_utf8([Some(v)].into_iter().collect()),
+            DataValue::String(v) => Self::new_string([Some(v)].into_iter().collect()),
             DataValue::Blob(v) => Self::new_blob([Some(v)].into_iter().collect()),
             &DataValue::Decimal(v) => Self::new_decimal([v].into_iter().collect()),
             &DataValue::Date(v) => Self::new_date([v].into_iter().collect()),
+            &DataValue::Timestamp(v) => Self::new_timestamp([v].into_iter().collect()),
+            &DataValue::TimestampTz(v) => Self::new_timestamp_tz([v].into_iter().collect()),
             &DataValue::Interval(v) => Self::new_interval([v].into_iter().collect()),
+            DataValue::Vector(v) => Self::new_vector([Some(v)].into_iter().collect()),
         }
     }
 }

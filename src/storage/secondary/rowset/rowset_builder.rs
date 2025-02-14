@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
 
@@ -31,7 +31,11 @@ impl RowsetBuilder {
             builders: columns
                 .iter()
                 .map(|column| {
-                    ColumnBuilderImpl::new_from_datatype(&column.datatype(), column_options.clone())
+                    ColumnBuilderImpl::new_from_datatype(
+                        &column.data_type(),
+                        column.is_nullable(),
+                        column_options.clone(),
+                    )
                 })
                 .collect_vec(),
             columns,

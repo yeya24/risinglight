@@ -1,33 +1,34 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::TryStreamExt;
+use minitrace::collector::SpanContext;
+use minitrace::Span;
 use risinglight_proto::rowset::block_statistics::BlockStatisticsType;
-use tracing::debug;
 
-use crate::array::{
-    ArrayBuilder, ArrayBuilderImpl, Chunk, DataChunk, I32ArrayBuilder, Utf8ArrayBuilder,
-};
-use crate::catalog::RootCatalogRef;
+use crate::array::Chunk;
+use crate::binder::bind_header;
+use crate::catalog::{RootCatalog, RootCatalogRef, TableRefId};
 use crate::parser::{parse, ParserError};
+use crate::planner::{Expr, RecExpr, Statistics};
 use crate::storage::{
     InMemoryStorage, SecondaryStorage, SecondaryStorageOptions, Storage, StorageColumnRef,
     StorageImpl, Table,
 };
-use crate::v1::binder::Binder;
-use crate::v1::executor::ExecutorBuilder;
-use crate::v1::logical_planner::LogicalPlaner;
-use crate::v1::optimizer::logical_plan_rewriter::{InputRefResolver, PlanRewriter};
-use crate::v1::optimizer::plan_nodes::PlanRef;
-use crate::v1::optimizer::Optimizer;
 
 /// The database instance.
 pub struct Database {
     catalog: RootCatalogRef,
     storage: StorageImpl,
-    use_v1: AtomicBool,
+    config: Mutex<Config>,
+}
+
+/// The configuration of the database.
+#[derive(Debug, Default)]
+struct Config {
+    disable_optimizer: bool,
+    mock_stat: Option<Statistics>,
 }
 
 impl Database {
@@ -37,7 +38,7 @@ impl Database {
         Database {
             catalog: storage.catalog().clone(),
             storage: StorageImpl::InMemoryStorage(Arc::new(storage)),
-            use_v1: AtomicBool::new(false),
+            config: Default::default(),
         }
     }
 
@@ -48,7 +49,7 @@ impl Database {
         Database {
             catalog: storage.catalog().clone(),
             storage: StorageImpl::SecondaryStorage(storage),
-            use_v1: AtomicBool::new(false),
+            config: Default::default(),
         }
     }
 
@@ -59,204 +60,142 @@ impl Database {
         Ok(())
     }
 
-    fn run_dt(&self) -> Result<Vec<Chunk>, Error> {
-        let mut db_id_vec = I32ArrayBuilder::new();
-        let mut db_vec = Utf8ArrayBuilder::new();
-        let mut schema_id_vec = I32ArrayBuilder::new();
-        let mut schema_vec = Utf8ArrayBuilder::new();
-        let mut table_id_vec = I32ArrayBuilder::new();
-        let mut table_vec = Utf8ArrayBuilder::new();
-        for (_, database) in self.catalog.all_databases() {
-            for (_, schema) in database.all_schemas() {
-                for (_, table) in schema.all_tables() {
-                    db_id_vec.push(Some(&(database.id() as i32)));
-                    db_vec.push(Some(&database.name()));
-                    schema_id_vec.push(Some(&(schema.id() as i32)));
-                    schema_vec.push(Some(&schema.name()));
-                    table_id_vec.push(Some(&(table.id() as i32)));
-                    table_vec.push(Some(&table.name()));
-                }
-            }
-        }
-        let vecs: Vec<ArrayBuilderImpl> = vec![
-            db_id_vec.into(),
-            db_vec.into(),
-            schema_id_vec.into(),
-            schema_vec.into(),
-            table_id_vec.into(),
-            table_vec.into(),
-        ];
-        Ok(vec![Chunk::new(vec![DataChunk::from_iter(
-            vecs.into_iter(),
-        )])])
-    }
-
-    pub async fn run_internal(&self, cmd: &str) -> Result<Vec<Chunk>, Error> {
-        if let Some((cmd, arg)) = cmd.split_once(' ') {
-            if cmd == "stat" {
-                if let StorageImpl::SecondaryStorage(ref storage) = self.storage {
-                    let (table, col) = arg.split_once(' ').expect("failed to parse command");
-                    let table_id = self
-                        .catalog
-                        .get_table_id_by_name("postgres", "postgres", table)
-                        .expect("table not found");
-                    let col_id = self
-                        .catalog
-                        .get_table(&table_id)
-                        .unwrap()
-                        .get_column_id_by_name(col)
-                        .expect("column not found");
-                    let table = storage.get_table(table_id)?;
-                    let txn = table.read().await?;
-                    let row_count = txn.aggreagate_block_stat(&[
-                        (
-                            BlockStatisticsType::RowCount,
-                            // Note that `col_id` is the column catalog id instead of storage
-                            // column id. This should be fixed in the
-                            // future.
-                            StorageColumnRef::Idx(col_id),
-                        ),
-                        (
-                            BlockStatisticsType::DistinctValue,
-                            StorageColumnRef::Idx(col_id),
-                        ),
-                    ]);
-                    let mut stat_name = Utf8ArrayBuilder::with_capacity(2);
-                    let mut stat_value = Utf8ArrayBuilder::with_capacity(2);
-                    stat_name.push(Some("RowCount"));
-                    stat_value.push(Some(
-                        row_count[0]
-                            .as_usize()
-                            .unwrap()
-                            .unwrap()
-                            .to_string()
-                            .as_str(),
-                    ));
-                    stat_name.push(Some("DistinctValue"));
-                    stat_value.push(Some(
-                        row_count[1]
-                            .as_usize()
-                            .unwrap()
-                            .unwrap()
-                            .to_string()
-                            .as_str(),
-                    ));
-                    Ok(vec![Chunk::new(vec![DataChunk::from_iter([
-                        ArrayBuilderImpl::from(stat_name),
-                        ArrayBuilderImpl::from(stat_value),
-                    ])])])
-                } else {
-                    Err(Error::InternalError(
-                        "this storage engine doesn't support statistics".to_string(),
-                    ))
-                }
-            } else {
-                Err(Error::InternalError("unsupported command".to_string()))
-            }
-        } else if cmd == "dt" {
-            self.run_dt()
-        } else if cmd == "v1" || cmd == "v2" {
-            self.use_v1.store(cmd == "v1", Ordering::Relaxed);
-            println!("switched to query engine {cmd}");
-            Ok(vec![])
-        } else {
-            Err(Error::InternalError("unsupported command".to_string()))
-        }
+    /// Convert a command to SQL.
+    fn command_to_sql(&self, cmd: &str) -> Result<String, Error> {
+        let tokens = cmd.split_whitespace().collect::<Vec<_>>();
+        Ok(match tokens.as_slice() {
+            ["dt"] => "SELECT * FROM pg_catalog.pg_tables".to_string(),
+            ["di"] => "SELECT * FROM pg_catalog.pg_indexes".to_string(),
+            ["d", table] => format!(
+                "SELECT * FROM pg_catalog.pg_attribute WHERE table_name = '{table}'",
+            ),
+            ["stat"] => "SELECT * FROM pg_catalog.pg_stat".to_string(),
+            ["stat", table] => format!("SELECT * FROM pg_catalog.pg_stat WHERE table_name = '{table}'"),
+            ["stat", table, column] => format!(
+                "SELECT * FROM pg_catalog.pg_stat WHERE table_name = '{table}' AND column_name = '{column}'",
+            ),
+            _ => return Err(Error::Internal("invalid command".into())),
+        })
     }
 
     /// Run SQL queries and return the outputs.
     pub async fn run(&self, sql: &str) -> Result<Vec<Chunk>, Error> {
-        if let Some(cmdline) = sql.trim().strip_prefix('\\') {
-            return self.run_internal(cmdline).await;
-        }
-        if self.use_v1.load(Ordering::Relaxed) {
-            return self.run_v1(sql).await;
-        }
+        let _root = Span::root("run_sql", SpanContext::random());
 
-        let stmts = parse(sql)?;
+        let sql = if let Some(cmd) = sql.trim().strip_prefix('\\') {
+            self.command_to_sql(cmd)?
+        } else {
+            sql.to_string()
+        };
+
+        let optimizer = crate::planner::Optimizer::new(
+            self.catalog.clone(),
+            self.get_storage_statistics().await?,
+            crate::planner::Config {
+                enable_range_filter_scan: self.storage.support_range_filter_scan(),
+                table_is_sorted_by_primary_key: self.storage.table_is_sorted_by_primary_key(),
+            },
+        );
+
+        let stmts = parse(&sql)?;
         let mut outputs: Vec<Chunk> = vec![];
         for stmt in stmts {
-            let mut binder = crate::binder_v2::Binder::new(self.catalog.clone());
-            let bound = binder.bind(stmt)?;
-            let optimized = crate::planner::optimize(&bound);
+            let mut binder = crate::binder::Binder::new(self.catalog.clone());
+            let mut plan = binder.bind(stmt.clone()).map_err(|e| e.with_sql(&sql))?;
+            if self.handle_set(&plan)? {
+                continue;
+            }
+            if !self.config.lock().unwrap().disable_optimizer {
+                plan = optimizer.optimize(plan);
+            }
             let executor = match self.storage.clone() {
                 StorageImpl::InMemoryStorage(s) => {
-                    crate::executor_v2::build(self.catalog.clone(), s, &optimized)
+                    crate::executor::build(optimizer.clone(), s, &plan)
                 }
                 StorageImpl::SecondaryStorage(s) => {
-                    crate::executor_v2::build(self.catalog.clone(), s, &optimized)
+                    crate::executor::build(optimizer.clone(), s, &plan)
                 }
             };
             let output = executor.try_collect().await?;
-            let chunk = Chunk::new(output);
-            // TODO: set name
-            outputs.push(chunk);
-        }
-        Ok(outputs)
-    }
-
-    /// Run SQL queries using query engine v1.
-    async fn run_v1(&self, sql: &str) -> Result<Vec<Chunk>, Error> {
-        let stmts = parse(sql)?;
-        let mut binder = Binder::new(self.catalog.clone());
-        let logical_planner = LogicalPlaner::default();
-        let mut optimizer = Optimizer {
-            enable_filter_scan: self.storage.enable_filter_scan(),
-        };
-        // TODO: parallelize
-        let mut outputs: Vec<Chunk> = vec![];
-        for stmt in stmts {
-            debug!("{:#?}", stmt);
-            let stmt = binder.bind(&stmt)?;
-            debug!("{:#?}", stmt);
-            let logical_plan = logical_planner.plan(stmt)?;
-            debug!("{:#?}", logical_plan);
-            // Resolve input reference
-            let mut input_ref_resolver = InputRefResolver::default();
-            let logical_plan = input_ref_resolver.rewrite(logical_plan);
-            let column_names = logical_plan.out_names();
-            debug!("{:#?}", logical_plan);
-            let optimized_plan = optimizer.optimize(logical_plan);
-            debug!("{:#?}", optimized_plan);
-
-            let mut executor_builder = ExecutorBuilder::new(self.storage.clone());
-            let executor = executor_builder.build(optimized_plan);
-
-            let output = executor.try_collect().await?;
-
             let mut chunk = Chunk::new(output);
-            if !column_names.is_empty() && !chunk.data_chunks().is_empty() {
-                chunk.set_header(column_names);
-            }
+            chunk = bind_header(chunk, &stmt);
             outputs.push(chunk);
         }
         Ok(outputs)
     }
 
-    // Generate the execution plans for SQL queries.
-    pub fn generate_execution_plan(&self, sql: &str) -> Result<Vec<PlanRef>, Error> {
-        let stmts = parse(sql)?;
-
-        let mut binder = Binder::new(self.catalog.clone());
-        let logical_planner = LogicalPlaner::default();
-        let mut optimizer = Optimizer {
-            enable_filter_scan: self.storage.enable_filter_scan(),
-        };
-        let mut plans = vec![];
-        for stmt in stmts {
-            let stmt = binder.bind(&stmt)?;
-            debug!("{:#?}", stmt);
-            let logical_plan = logical_planner.plan(stmt)?;
-            debug!("{:#?}", logical_plan);
-            // Resolve input reference
-            let mut input_ref_resolver = InputRefResolver::default();
-            let logical_plan = input_ref_resolver.rewrite(logical_plan);
-            debug!("{:#?}", logical_plan);
-            let optimized_plan = optimizer.optimize(logical_plan);
-            debug!("{:#?}", optimized_plan);
-            plans.push(optimized_plan);
+    async fn get_storage_statistics(&self) -> Result<Statistics, Error> {
+        if let Some(mock) = &self.config.lock().unwrap().mock_stat {
+            return Ok(mock.clone());
         }
-        Ok(plans)
+        let mut stat = Statistics::default();
+        // only secondary storage supports statistics
+        let StorageImpl::SecondaryStorage(storage) = self.storage.clone() else {
+            return Ok(stat);
+        };
+        for schema in self.catalog.all_schemas().values() {
+            // skip internal schema
+            if schema.name() == RootCatalog::SYSTEM_SCHEMA_NAME {
+                continue;
+            }
+            for table in schema.all_tables().values() {
+                if table.is_view() {
+                    continue;
+                }
+                let table_id = TableRefId::new(schema.id(), table.id());
+                let table = storage.get_table(table_id)?;
+                let txn = table.read().await?;
+                let values = txn.aggreagate_block_stat(&[(
+                    BlockStatisticsType::RowCount,
+                    StorageColumnRef::Idx(0),
+                )]);
+                stat.add_row_count(table_id, values[0].as_usize().unwrap().unwrap() as u32);
+            }
+        }
+        Ok(stat)
+    }
+
+    /// Handle PRAGMA and SET statements.
+    fn handle_set(&self, plan: &RecExpr) -> Result<bool, Error> {
+        let root = &plan.as_ref()[plan.as_ref().len() - 1];
+        match root {
+            Expr::Pragma([name, _value]) => match plan[*name].as_const().as_str() {
+                "enable_optimizer" => {
+                    self.config.lock().unwrap().disable_optimizer = false;
+                    Ok(true)
+                }
+                "disable_optimizer" => {
+                    self.config.lock().unwrap().disable_optimizer = true;
+                    Ok(true)
+                }
+                name => Err(Error::Internal(format!("no such pragma: {name}"))),
+            },
+            Expr::Set([name, value]) => match plan[*name].as_const().as_str() {
+                // Mock the row count of a table for planner test.
+                name if name.starts_with("mock_rowcount_") => {
+                    let table_name = name.strip_prefix("mock_rowcount_").unwrap();
+                    let count = plan[*value].as_const().as_usize().unwrap().unwrap() as u32;
+                    let table_id = self
+                        .catalog
+                        .get_table_id_by_name("postgres", table_name)
+                        .ok_or_else(|| Error::Internal("table not found".into()))?;
+                    self.config
+                        .lock()
+                        .unwrap()
+                        .mock_stat
+                        .get_or_insert_with(Default::default)
+                        .add_row_count(table_id, count);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
+            _ => Ok(false),
+        }
+    }
+
+    /// Return all available pragma options.
+    fn pragma_options() -> &'static [&'static str] {
+        &["enable_optimizer", "disable_optimizer"]
     }
 }
 
@@ -270,42 +209,125 @@ pub enum Error {
         ParserError,
     ),
     #[error("bind error: {0}")]
-    BindV1(
+    Bind(
         #[source]
         #[from]
-        crate::v1::binder::BindError,
-    ),
-    #[error("bind error: {0}")]
-    BindV2(
-        #[source]
-        #[from]
-        crate::binder_v2::BindError,
-    ),
-    #[error("logical plan error: {0}")]
-    PlanV1(
-        #[source]
-        #[from]
-        crate::v1::logical_planner::LogicalPlanError,
+        crate::binder::BindError,
     ),
     #[error("execute error: {0}")]
-    ExecuteV1(
+    Execute(
         #[source]
         #[from]
-        crate::v1::executor::ExecutorError,
-    ),
-    #[error("execute error: {0}")]
-    ExecuteV2(
-        #[source]
-        #[from]
-        crate::executor_v2::ExecutorError,
+        crate::executor::ExecutorError,
     ),
     #[error("Storage error: {0}")]
-    StorageError(
+    Storage(
         #[source]
         #[from]
         #[backtrace]
         crate::storage::TracedStorageError,
     ),
     #[error("Internal error: {0}")]
-    InternalError(String),
+    Internal(String),
+}
+
+impl rustyline::Helper for &Database {}
+impl rustyline::validate::Validator for &Database {}
+impl rustyline::highlight::Highlighter for &Database {}
+impl rustyline::hint::Hinter for &Database {
+    type Hint = String;
+}
+
+/// Implement SQL completion.
+impl rustyline::completion::Completer for &Database {
+    type Candidate = rustyline::completion::Pair;
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        // find the word before cursor
+        let (prefix, last_word) = line[..pos].rsplit_once(' ').unwrap_or(("", &line[..pos]));
+
+        // completion for pragma options
+        if prefix.trim().eq_ignore_ascii_case("pragma") {
+            let candidates = Database::pragma_options()
+                .iter()
+                .filter(|option| option.starts_with(last_word))
+                .map(|option| rustyline::completion::Pair {
+                    display: option.to_string(),
+                    replacement: option.to_string(),
+                })
+                .collect();
+            return Ok((pos - last_word.len(), candidates));
+        }
+
+        // TODO: complete table and column names
+
+        // completion for keywords
+
+        // for a given prefix, all keywords starting with the prefix are returned as candidates
+        // they should be ordered in principle that frequently used ones come first
+        const KEYWORDS: &[&str] = &[
+            "AS", "ALL", "ANALYZE", "CREATE", "COPY", "DELETE", "DROP", "EXPLAIN", "FROM",
+            "FUNCTION", "INSERT", "JOIN", "ON", "PRAGMA", "SET", "SELECT", "TABLE", "UNION",
+            "VIEW", "WHERE", "WITH",
+        ];
+        let last_word_upper = last_word.to_uppercase();
+        let candidates = KEYWORDS
+            .iter()
+            .filter(|command| command.starts_with(&last_word_upper))
+            .map(|command| rustyline::completion::Pair {
+                display: command.to_string(),
+                replacement: format!("{command} "),
+            })
+            .collect();
+        Ok((pos - last_word.len(), candidates))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustyline::history::DefaultHistory;
+
+    use super::*;
+
+    #[test]
+    fn test_completion() {
+        let db = Database::new_in_memory();
+        assert_complete(&db, "sel", "SELECT ");
+        assert_complete(&db, "sel|ect", "SELECT |ect");
+        assert_complete(&db, "select a f", "select a FROM ");
+        assert_complete(&db, "pragma en", "pragma enable_optimizer");
+    }
+
+    /// Assert that if complete (e.g. press tab) the given `line`, the result will be
+    /// `completed_line`.
+    ///
+    /// Both `line` and `completed_line` can optionally contain a `|` which indicates the cursor
+    /// position. If not provided, the cursor is assumed to be at the end of the line.
+    #[track_caller]
+    fn assert_complete(db: &Database, line: &str, completed_line: &str) {
+        /// Find cursor position and remove it from the line.
+        fn get_line_and_cursor(line: &str) -> (String, usize) {
+            let (before_cursor, after_cursor) = line.split_once('|').unwrap_or((line, ""));
+            let pos = before_cursor.len();
+            (format!("{before_cursor}{after_cursor}"), pos)
+        }
+        let (mut line, pos) = get_line_and_cursor(line);
+
+        // complete
+        use rustyline::completion::Completer;
+        let (start_pos, candidates) = db
+            .complete(&line, pos, &rustyline::Context::new(&DefaultHistory::new()))
+            .unwrap();
+        let replacement = &candidates[0].replacement;
+        line.replace_range(start_pos..pos, replacement);
+
+        // assert
+        let (completed_line, completed_cursor_pos) = get_line_and_cursor(completed_line);
+        assert_eq!(line, completed_line);
+        assert_eq!(start_pos + replacement.len(), completed_cursor_pos);
+    }
 }

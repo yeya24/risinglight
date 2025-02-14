@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use futures::Future;
 use risinglight_proto::rowset::block_index::BlockType;
@@ -25,16 +25,17 @@ pub trait BlockIteratorFactory<A: Array>: Send + Sync + 'static {
 
     /// Create a [`FakeBlockIterator`](super::super::block::FakeBlockIterator) from block index and
     /// seek to `start_pos`.
+    #[allow(dead_code)]
     fn get_fake_iterator(&self, index: &BlockIndex, start_pos: usize) -> Self::BlockIteratorImpl;
 }
 
 /// `ConcreteColumnIterator` Statistics
 #[derive(Debug, Default)]
 pub struct Statistics {
-    /// next_batch call times
+    /// `next_batch` call times
     next_batch_count: u32,
 
-    /// get_block call times
+    /// `get_block` call times
     fetched_block_count: u32,
 }
 
@@ -49,7 +50,7 @@ pub struct ConcreteColumnIterator<A: Array, F: BlockIteratorFactory<A>> {
     /// Block iterator.
     block_iterator: F::BlockIteratorImpl,
 
-    /// RowID of the current column.
+    /// `RowID` of the current column.
     current_row_id: u32,
 
     /// Indicates whether this iterator has finished or not.
@@ -58,7 +59,7 @@ pub struct ConcreteColumnIterator<A: Array, F: BlockIteratorFactory<A>> {
     /// The factory for creating iterators.
     factory: F,
 
-    /// Indicate whether current_block_iter is fake.
+    /// Indicate whether `current_block_iter` is fake.
     is_fake_iter: bool,
 
     /// Statistics which used for reporting.
@@ -167,8 +168,21 @@ impl<A: Array, F: BlockIteratorFactory<A>> ConcreteColumnIterator<A, F> {
             return (0, true);
         }
         let index = self.column.index().index(self.current_block_id);
+        let hint = (index.row_count - (self.current_row_id - index.first_rowid)) as usize;
         (
-            (index.row_count - (self.current_row_id - index.first_rowid)) as usize,
+            if hint == 0 {
+                // the row count of the next block if exists
+                if self.current_block_id + 1 < self.column.index().len() as u32 {
+                    self.column
+                        .index()
+                        .index(self.current_block_id + 1)
+                        .row_count as usize
+                } else {
+                    0
+                }
+            } else {
+                hint
+            },
             false,
         )
     }

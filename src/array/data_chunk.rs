@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::fmt;
 use std::ops::RangeBounds;
@@ -82,21 +82,25 @@ impl DataChunk {
         &self.arrays[idx]
     }
 
+    /// Get the mutable reference of array by index.
+    pub fn array_mut_at(&mut self, idx: usize) -> &mut ArrayImpl {
+        &mut Arc::get_mut(&mut self.arrays).unwrap()[idx]
+    }
+
     /// Get all arrays.
     pub fn arrays(&self) -> &[ArrayImpl] {
         &self.arrays
     }
 
     /// Filter elements and create a new chunk.
-    pub fn filter(&self, visibility: impl Iterator<Item = bool> + Clone) -> Self {
-        let arrays = self
-            .arrays
-            .iter()
-            .map(|a| a.filter(visibility.clone()))
-            .collect();
+    pub fn filter(&self, visibility: &[bool]) -> Self {
+        let arrays: Arc<[ArrayImpl]> = self.arrays.iter().map(|a| a.filter(visibility)).collect();
         DataChunk {
+            cardinality: match arrays.first() {
+                Some(a) => a.len(),
+                None => visibility.iter().filter(|b| **b).count(),
+            },
             arrays,
-            cardinality: visibility.filter(|b| *b).count(),
         }
     }
 
@@ -130,7 +134,7 @@ impl DataChunk {
         self.arrays.iter().map(|a| a.get_estimated_size()).sum()
     }
 
-    pub fn from_rows<'a>(rows: &[RowRef<'a>], chunk: &Self) -> Self {
+    pub fn from_rows(rows: &[RowRef<'_>], chunk: &Self) -> Self {
         let mut arrays = vec![];
         for col_idx in 0..chunk.column_count() {
             let mut builder = ArrayBuilderImpl::from_type_of_array(chunk.array_at(col_idx));
@@ -249,16 +253,20 @@ pub fn datachunk_to_sqllogictest_string(chunk: &Chunk) -> Vec<Vec<String>> {
                 let s = match array.get(row) {
                     DataValue::Null => "NULL".to_string(),
                     DataValue::Bool(v) => v.to_string(),
+                    DataValue::Int16(v) => v.to_string(),
                     DataValue::Int32(v) => v.to_string(),
                     DataValue::Int64(v) => v.to_string(),
                     DataValue::Float64(v) => v.to_string(),
                     DataValue::String(s) if s.is_empty() => "(empty)".to_string(),
-                    DataValue::String(s) => s,
+                    DataValue::String(s) => s.to_string(),
                     DataValue::Blob(s) if s.is_empty() => "(empty)".to_string(),
                     DataValue::Blob(s) => s.to_string(),
                     DataValue::Decimal(v) => v.to_string(),
                     DataValue::Date(v) => v.to_string(),
+                    DataValue::Timestamp(v) => v.to_string(),
+                    DataValue::TimestampTz(v) => v.to_string(),
                     DataValue::Interval(v) => v.to_string(),
+                    DataValue::Vector(v) => v.to_string(),
                 };
                 row_vec.push(s);
             }
@@ -294,5 +302,14 @@ impl RowRef<'_> {
 
     pub fn to_owned(&self) -> Row {
         self.values().collect()
+    }
+}
+
+impl PartialEq<&[DataValue]> for RowRef<'_> {
+    fn eq(&self, other: &&[DataValue]) -> bool {
+        if other.len() != self.chunk.column_count() {
+            return false;
+        }
+        self.values().zip(other.iter()).all(|(a, b)| &a == b)
     }
 }

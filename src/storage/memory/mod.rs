@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 //! In-memory storage implementation of RisingLight.
 //!
@@ -20,9 +20,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use super::{Storage, StorageError, StorageResult, TracedStorageError};
+use super::index::InMemoryIndexes;
+use super::{InMemoryIndex, Storage, StorageError, StorageResult, TracedStorageError};
+use crate::binder::IndexType;
 use crate::catalog::{
-    ColumnCatalog, ColumnId, DatabaseId, RootCatalog, RootCatalogRef, SchemaId, TableRefId,
+    ColumnCatalog, ColumnId, IndexId, RootCatalog, RootCatalogRef, SchemaId, TableId, TableRefId,
 };
 
 mod table;
@@ -41,6 +43,7 @@ pub use row_handler::InMemoryRowHandler;
 pub struct InMemoryStorage {
     catalog: RootCatalogRef,
     tables: Mutex<HashMap<TableRefId, InMemoryTable>>,
+    indexes: Mutex<InMemoryIndexes>,
 }
 
 impl Default for InMemoryStorage {
@@ -54,6 +57,7 @@ impl InMemoryStorage {
         InMemoryStorage {
             catalog: Arc::new(RootCatalog::new()),
             tables: Mutex::new(HashMap::new()),
+            indexes: Mutex::new(InMemoryIndexes::new()),
         }
     }
 
@@ -68,36 +72,29 @@ impl Storage for InMemoryStorage {
 
     async fn create_table(
         &self,
-        database_id: DatabaseId,
         schema_id: SchemaId,
         table_name: &str,
         column_descs: &[ColumnCatalog],
         ordered_pk_ids: &[ColumnId],
     ) -> StorageResult<()> {
-        let db = self
+        let schema = self
             .catalog
-            .get_database_by_id(database_id)
-            .ok_or_else(|| TracedStorageError::not_found("database", database_id))?;
-        let schema = db
             .get_schema_by_id(schema_id)
             .ok_or_else(|| TracedStorageError::not_found("schema", schema_id))?;
         if schema.get_table_by_name(table_name).is_some() {
             return Err(TracedStorageError::duplicated("table", table_name));
         }
-        let ref_id = TableRefId::new(database_id, schema_id, 0);
         let table_id = self
             .catalog
             .add_table(
-                ref_id,
+                schema_id,
                 table_name.into(),
                 column_descs.to_vec(),
-                false,
                 ordered_pk_ids.to_vec(),
             )
             .map_err(|_| StorageError::Duplicated("table", table_name.into()))?;
 
         let id = TableRefId {
-            database_id,
             schema_id,
             table_id,
         };
@@ -125,5 +122,53 @@ impl Storage for InMemoryStorage {
             .ok_or_else(|| TracedStorageError::not_found("table", table_id.table_id))?;
         self.catalog.drop_table(table_id);
         Ok(())
+    }
+
+    fn as_disk(&self) -> Option<&super::SecondaryStorage> {
+        None
+    }
+
+    async fn create_index(
+        &self,
+        schema_id: SchemaId,
+        index_name: &str,
+        table_id: TableId,
+        column_idxs: &[ColumnId],
+        index_type: &IndexType,
+    ) -> StorageResult<IndexId> {
+        let idx_id = self
+            .catalog
+            .add_index(
+                schema_id,
+                index_name.to_string(),
+                table_id,
+                column_idxs,
+                index_type,
+            )
+            .map_err(|_| StorageError::Duplicated("index", index_name.into()))?;
+        self.indexes
+            .lock()
+            .unwrap()
+            .add_index(schema_id, idx_id, table_id, column_idxs);
+        // TODO: populate the index
+        Ok(idx_id)
+    }
+
+    async fn get_index(
+        &self,
+        schema_id: SchemaId,
+        index_id: IndexId,
+    ) -> StorageResult<Arc<dyn InMemoryIndex>> {
+        let idx = self
+            .indexes
+            .lock()
+            .unwrap()
+            .get_index(schema_id, index_id)
+            .ok_or_else(|| StorageError::NotFound("index", index_id.to_string()))?;
+        Ok(idx)
+    }
+
+    fn get_catalog(&self) -> Arc<RootCatalog> {
+        self.catalog.clone()
     }
 }

@@ -1,10 +1,10 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 //! Basic serialization implementation of `RisingLight`.
 //!
 //! Note that this storage format is not stable. The current manifest persistence
 //! depends on the stability of state machine of in-memory catalog. Any change in
-//! catalog implementation, e.g., [`TableId`](crate::types::TableId) assignment, will break the
+//! catalog implementation, e.g., [`TableId`](crate::catalog::TableId) assignment, will break the
 //! manifest. We will later come up with a better manifest design.
 
 use std::io::SeekFrom;
@@ -18,11 +18,10 @@ use tracing::warn;
 
 use super::version_manager::EpochOp;
 use super::{SecondaryStorage, SecondaryTable, StorageResult, TracedStorageError};
-use crate::catalog::{ColumnCatalog, ColumnId, DatabaseId, SchemaId, TableRefId};
+use crate::catalog::{ColumnCatalog, ColumnId, SchemaId, TableRefId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateTableEntry {
-    pub database_id: DatabaseId,
     pub schema_id: SchemaId,
     pub table_name: String,
     pub column_descs: Vec<ColumnCatalog>,
@@ -101,6 +100,23 @@ impl Manifest {
         })
     }
 
+    // Reopen manifest file at `path` and seek to the end of file.
+    pub async fn reopen(&mut self, path: impl AsRef<Path>) -> StorageResult<()> {
+        if self.file.is_some() {
+            let mut file = OpenOptions::default()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(path.as_ref())
+                .await?;
+            // Seek to end directly as the compacted manifest won't be replayed.
+            file.seek(SeekFrom::End(0)).await?;
+            self.file = Some(file);
+        }
+
+        Ok(())
+    }
+
     pub async fn replay(&mut self) -> StorageResult<Vec<ManifestOperation>> {
         let file = if let Some(file) = &mut self.file {
             file
@@ -170,37 +186,30 @@ impl Manifest {
 impl SecondaryStorage {
     pub(super) fn apply_create_table(&self, entry: &CreateTableEntry) -> StorageResult<()> {
         let CreateTableEntry {
-            database_id,
             schema_id,
             table_name,
             column_descs,
             ordered_pk_ids,
         } = entry.clone();
 
-        let db = self
+        let schema = self
             .catalog
-            .get_database_by_id(database_id)
-            .ok_or_else(|| TracedStorageError::not_found("database", database_id))?;
-        let schema = db
             .get_schema_by_id(schema_id)
             .ok_or_else(|| TracedStorageError::not_found("schema", schema_id))?;
         if schema.get_table_by_name(&table_name).is_some() {
             return Err(TracedStorageError::duplicated("table", table_name));
         }
-        let ref_id = TableRefId::new(database_id, schema_id, 0);
         let table_id = self
             .catalog
             .add_table(
-                ref_id,
+                schema_id,
                 table_name.clone(),
                 column_descs.to_vec(),
-                false,
-                ordered_pk_ids,
+                ordered_pk_ids.clone(),
             )
             .map_err(|_| TracedStorageError::duplicated("table", table_name))?;
 
         let id = TableRefId {
-            database_id,
             schema_id,
             table_id,
         };
@@ -212,6 +221,7 @@ impl SecondaryStorage {
             self.version.clone(),
             self.block_cache.clone(),
             self.txn_mgr.clone(),
+            ordered_pk_ids,
         );
         self.tables.write().insert(id, table);
 
@@ -220,14 +230,12 @@ impl SecondaryStorage {
 
     pub(super) async fn create_table_inner(
         &self,
-        database_id: DatabaseId,
         schema_id: SchemaId,
         table_name: &str,
         column_descs: &[ColumnCatalog],
         ordered_pk_ids: &[ColumnId],
     ) -> StorageResult<()> {
         let entry = CreateTableEntry {
-            database_id,
             schema_id,
             table_name: table_name.to_string(),
             column_descs: column_descs.to_vec(),

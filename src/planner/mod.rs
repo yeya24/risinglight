@@ -1,17 +1,21 @@
-use egg::{define_language, CostFunction, Id, Symbol};
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
-use crate::binder_v2::copy::ExtSource;
-use crate::binder_v2::{BoundDrop, CreateTable};
+use egg::{define_language, Id, Symbol};
+
+use crate::binder::copy::ExtSource;
+use crate::binder::{CreateFunction, CreateIndex, CreateTable};
 use crate::catalog::{ColumnRefId, TableRefId};
 use crate::parser::{BinaryOperator, UnaryOperator};
-use crate::types::{ColumnIndex, DataTypeKind, DataValue};
+use crate::types::{ColumnIndex, DataType, DataValue, DateTimeField};
 
 mod cost;
 mod explain;
+mod optimizer;
 mod rules;
 
 pub use explain::Explain;
-pub use rules::{ColumnIndexResolver, ExprAnalysis, TypeError, TypeSchemaAnalysis};
+pub use optimizer::{Config, Optimizer};
+pub use rules::{ExprAnalysis, Statistics, TypeError, TypeSchemaAnalysis};
 
 // Alias types for our language.
 type EGraph = egg::EGraph<Expr, ExprAnalysis>;
@@ -23,14 +27,15 @@ define_language! {
     pub enum Expr {
         // values
         Constant(DataValue),            // null, true, 1, 1.0, "hello", ...
-        Type(DataTypeKind),             // BOOLEAN, INT, DECIMAL(5), ...
+        Type(DataType),                 // BOOLEAN, INT, DECIMAL(5), ...
         Column(ColumnRefId),            // $1.2, $2.1, ...
         Table(TableRefId),              // $1, $2, ...
         ColumnIndex(ColumnIndex),       // #0, #1, ...
-        ExtSource(ExtSource),
 
         // utilities
-        "`" = Nested(Id),               // (` expr) a wrapper over expr to prevent optimization
+        "ref" = Ref(Id),                // (ref expr)
+                                            // refer the expr as a column
+                                            // it can also prevent optimization
         "list" = List(Box<[Id]>),       // (list ...)
 
         // binary operations
@@ -58,56 +63,88 @@ define_language! {
 
         "if" = If([Id; 3]),                     // (if cond then else)
 
-        // aggregates
+        // functions
+        "extract" = Extract([Id; 2]),           // (extract field expr)
+            Field(DateTimeField),
+        "replace" = Replace([Id; 3]),           // (replace expr pattern replacement)
+        "substring" = Substring([Id; 3]),       // (substring expr start length)
+
+        // vector functions
+        "<->" = VectorL2Distance([Id; 2]),
+        "<#>" = VectorNegtiveInnerProduct([Id; 2]),
+        "<=>" = VectorCosineDistance([Id; 2]),
+
+        // aggregations
         "max" = Max(Id),
         "min" = Min(Id),
         "sum" = Sum(Id),
         "avg" = Avg(Id),
         "count" = Count(Id),
+        "count-distinct" = CountDistinct(Id),
         "rowcount" = RowCount,
         "first" = First(Id),
         "last" = Last(Id),
+        // window functions
+        "over" = Over([Id; 3]),                 // (over window_function [partition_key..] [order_key..])
+        // TODO: support frame clause
+            // "range" = Range([Id; 2]),               // (range start end)
+        "row_number" = RowNumber,
 
         // subquery related
-        "exists" = Exists(Id),
-        "in" = In([Id; 2]),
+        "exists" = Exists(Id),                  // (exists plan)
+        "in" = In([Id; 2]),                     // (in expr plan)
 
         "cast" = Cast([Id; 2]),                 // (cast type expr)
 
         // plans
-        "scan" = Scan([Id; 2]),                 // (scan table [column..])
+        "scan" = Scan([Id; 3]),                 // (scan table [column..] filter)
+        "index_scan" = IndexScan([Id; 5]), // (index_scan table [column..] filter key value)
         "values" = Values(Box<[Id]>),           // (values [expr..]..)
         "proj" = Proj([Id; 2]),                 // (proj [expr..] child)
         "filter" = Filter([Id; 2]),             // (filter expr child)
         "order" = Order([Id; 2]),               // (order [order_key..] child)
-            "asc" = Asc(Id),                        // (asc key)
             "desc" = Desc(Id),                      // (desc key)
         "limit" = Limit([Id; 3]),               // (limit limit offset child)
         "topn" = TopN([Id; 4]),                 // (topn limit offset [order_key..] child)
-        "join" = Join([Id; 4]),                 // (join join_type expr left right)
-        "hashjoin" = HashJoin([Id; 5]),         // (hashjoin join_type [left_expr..] [right_expr..] left right)
+        "join" = Join([Id; 4]),                 // (join join_type cond left right)
+        "hashjoin" = HashJoin([Id; 6]),         // (hashjoin  join_type cond [lkey..] [rkey..] left right)
+        "mergejoin" = MergeJoin([Id; 6]),       // (mergejoin join_type cond [lkey..] [rkey..] left right)
+        "apply" = Apply([Id; 3]),               // (apply type left right)
             "inner" = Inner,
             "left_outer" = LeftOuter,
             "right_outer" = RightOuter,
             "full_outer" = FullOuter,
-        "agg" = Agg([Id; 3]),                   // (agg aggs=[expr..] group_keys=[expr..] child)
-                                                    // expressions must be agg
-                                                    // output = aggs || group_keys
-        CreateTable(CreateTable),
-        Drop(BoundDrop),
+            "semi" = Semi,
+            "anti" = Anti,
+        "agg" = Agg([Id; 2]),                   // (agg aggs=[expr..] child)
+                                                    // expressions must be aggregate functions
+        "hashagg" = HashAgg([Id; 3]),           // (hashagg keys=[expr..] aggs=[expr..] child)
+                                                    // output = keys || aggs
+        "sortagg" = SortAgg([Id; 3]),           // (sortagg keys=[expr..] aggs=[expr..] child)
+                                                    // child must be ordered by keys
+        "window" = Window([Id; 2]),             // (window [over..] child)
+                                                    // output = child || exprs
+        CreateTable(Box<CreateTable>),
+        CreateIndex(Box<CreateIndex>),
+        "create_view" = CreateView([Id; 2]),    // (create_view create_table child)
+        CreateFunction(CreateFunction),
+        "drop" = Drop(Id),                      // (drop [table..])
         "insert" = Insert([Id; 3]),             // (insert table [column..] child)
         "delete" = Delete([Id; 2]),             // (delete table child)
         "copy_from" = CopyFrom([Id; 2]),        // (copy_from dest types)
         "copy_to" = CopyTo([Id; 2]),            // (copy_to dest child)
+            ExtSource(Box<ExtSource>),
         "explain" = Explain(Id),                // (explain child)
+        "analyze" = Analyze(Id),                // (analyze child)
+        "pragma" = Pragma([Id; 2]),             // (pragma name value)
+        "set" = Set([Id; 2]),                   // (set name value)
 
         // internal functions
-        "prune" = Prune([Id; 2]),               // (prune node child)
-                                                    // do column prune on `child`
-                                                    // with the used columns in `node`
-        "empty" = Empty(Box<[Id]>),             // (empty child..)
+        "empty" = Empty(Id),                    // (empty child)
                                                     // returns empty chunk
                                                     // with the same schema as `child`
+        "max1row" = Max1Row(Id),                // (max1row child)
+                                                    // convert table to scalar
 
         Symbol(Symbol),
     }
@@ -127,33 +164,52 @@ impl Expr {
     }
 
     pub fn as_const(&self) -> DataValue {
-        let Self::Constant(v) = self else { panic!("not a constant: {self}") };
+        let Self::Constant(v) = self else {
+            panic!("not a constant: {self}")
+        };
         v.clone()
     }
 
     pub fn as_list(&self) -> &[Id] {
-        let Self::List(l) = self else { panic!("not a list: {self}") };
+        let Self::List(l) = self else {
+            panic!("not a list: {self}")
+        };
         l
     }
 
     pub fn as_column(&self) -> ColumnRefId {
-        let Self::Column(c) = self else { panic!("not a columnn: {self}") };
+        let Self::Column(c) = self else {
+            panic!("not a columnn: {self}")
+        };
         *c
     }
 
     pub fn as_table(&self) -> TableRefId {
-        let Self::Table(t) = self else { panic!("not a table: {self}") };
+        let Self::Table(t) = self else {
+            panic!("not a table: {self}")
+        };
         *t
     }
 
-    pub fn as_type(&self) -> &DataTypeKind {
-        let Self::Type(t) = self else { panic!("not a type: {self}") };
+    pub fn as_type(&self) -> &DataType {
+        let Self::Type(t) = self else {
+            panic!("not a type: {self}")
+        };
         t
     }
 
-    pub fn as_ext_source(&self) -> ExtSource {
-        let Self::ExtSource(v) = self else { panic!("not an external source: {self}") };
+    pub fn as_create_table(&self) -> Box<CreateTable> {
+        let Self::CreateTable(v) = self else {
+            panic!("not a create table: {self}")
+        };
         v.clone()
+    }
+
+    pub fn as_ext_source(&self) -> ExtSource {
+        let Self::ExtSource(v) = self else {
+            panic!("not an external source: {self}")
+        };
+        *v.clone()
     }
 
     pub const fn binary_op(&self) -> Option<(BinaryOperator, Id, Id)> {
@@ -188,10 +244,32 @@ impl Expr {
             _ => return None,
         })
     }
+
+    pub const fn is_aggregate_function(&self) -> bool {
+        use Expr::*;
+        matches!(
+            self,
+            RowCount
+                | Max(_)
+                | Min(_)
+                | Sum(_)
+                | Avg(_)
+                | Count(_)
+                | CountDistinct(_)
+                | First(_)
+                | Last(_)
+        )
+    }
+
+    pub const fn is_window_function(&self) -> bool {
+        use Expr::*;
+        matches!(self, RowNumber) || self.is_aggregate_function()
+    }
 }
 
 trait ExprExt {
     fn as_list(&self) -> &[Id];
+    fn as_column(&self) -> ColumnRefId;
 }
 
 impl<D> ExprExt for egg::EClass<Expr, D> {
@@ -201,67 +279,15 @@ impl<D> ExprExt for egg::EClass<Expr, D> {
                 Expr::List(list) => Some(list),
                 _ => None,
             })
-            .expect("not list")
-    }
-}
-
-/// Optimize the given expression.
-pub fn optimize(expr: &RecExpr) -> RecExpr {
-    // 1. column pruning
-    // TODO: remove unused analysis
-    let runner = egg::Runner::default()
-        .with_expr(expr)
-        .run(&*rules::STAGE1_RULES);
-    let extractor = egg::Extractor::new(&runner.egraph, cost::NoPrune);
-    let (_, mut expr) = extractor.find_best(runner.roots[0]);
-
-    // 2. pushdown
-    let mut best_cost = f32::MAX;
-    // to prune costy nodes, we iterate multiple times and only keep the best one for each run.
-    for _ in 0..3 {
-        let runner = egg::Runner::default()
-            .with_expr(&expr)
-            .with_iter_limit(6)
-            .run(&*rules::STAGE2_RULES);
-        let cost_fn = cost::CostFn {
-            egraph: &runner.egraph,
-        };
-        let extractor = egg::Extractor::new(&runner.egraph, cost_fn);
-        let cost;
-        (cost, expr) = extractor.find_best(runner.roots[0]);
-        if cost >= best_cost {
-            break;
-        }
-        best_cost = cost;
-        // println!(
-        //     "{i}:\n{}",
-        //     crate::planner::Explain::with_costs(&expr, &costs(&expr))
-        // );
+            .expect("not a list")
     }
 
-    // 3. join reorder and hashjoin
-    let runner = egg::Runner::default()
-        .with_expr(&expr)
-        .run(&*rules::STAGE3_RULES);
-    let cost_fn = cost::CostFn {
-        egraph: &runner.egraph,
-    };
-    let extractor = egg::Extractor::new(&runner.egraph, cost_fn);
-    (_, expr) = extractor.find_best(runner.roots[0]);
-
-    expr
-}
-
-/// Returns the cost for each node in the expression.
-pub fn costs(expr: &RecExpr) -> Vec<f32> {
-    let mut egraph = EGraph::default();
-    // NOTE: we assume Expr node has the same Id in both EGraph and RecExpr.
-    egraph.add_expr(expr);
-    let mut cost_fn = cost::CostFn { egraph: &egraph };
-    let mut costs = vec![0.0; expr.as_ref().len()];
-    for (i, node) in expr.as_ref().iter().enumerate() {
-        let cost = cost_fn.cost(node, |i| costs[usize::from(i)]);
-        costs[i] = cost;
+    fn as_column(&self) -> ColumnRefId {
+        self.iter()
+            .find_map(|e| match e {
+                Expr::Column(cid) => Some(*cid),
+                _ => None,
+            })
+            .expect("not a column")
     }
-    costs
 }

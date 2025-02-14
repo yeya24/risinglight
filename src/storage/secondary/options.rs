@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -61,7 +61,7 @@ pub struct StorageOptions {
     /// Encode type
     pub encode_type: EncodeType,
 
-    /// Whether record first_key of each block into block_index
+    /// Whether record `first_key` of each block into `block_index`
     pub record_first_key: bool,
 
     /// Whether to disable all disk operations, only for test use
@@ -71,7 +71,7 @@ pub struct StorageOptions {
 impl StorageOptions {
     pub fn default_for_cli() -> Self {
         Self {
-            path: PathBuf::new().join("risinglight.secondary.db"),
+            path: PathBuf::new().join("risinglight.db"),
             cache_size: 262144,                  // 4GB (16KB * 262144)
             target_rowset_size: 256 * (1 << 20), // 256MB
             target_block_size: 16 * (1 << 10),   // 16KB
@@ -83,7 +83,8 @@ impl StorageOptions {
             },
             checksum_type: ChecksumType::Crc32,
             encode_type: EncodeType::Plain,
-            record_first_key: false,
+            // required by range-filter scan rule
+            record_first_key: true,
             disable_all_disk_operation: false,
         }
     }
@@ -97,7 +98,8 @@ impl StorageOptions {
             io_backend: IOBackend::in_memory(),
             checksum_type: ChecksumType::None,
             encode_type: EncodeType::Plain,
-            record_first_key: false,
+            // required by range-filter scan rule
+            record_first_key: true,
             disable_all_disk_operation: true,
         }
     }
@@ -115,7 +117,7 @@ pub struct ColumnBuilderOptions {
     /// Encode type
     pub encode_type: EncodeType,
 
-    /// Whether record first_key of each block
+    /// Whether record `first_key` of each block
     pub record_first_key: bool,
 }
 

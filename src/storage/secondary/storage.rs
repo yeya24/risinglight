@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -12,10 +12,11 @@ use tracing::info;
 
 use super::{DiskRowset, Manifest, SecondaryStorage, StorageOptions, StorageResult};
 use crate::catalog::RootCatalog;
+use crate::storage::index::InMemoryIndexes;
 use crate::storage::secondary::manifest::*;
 use crate::storage::secondary::transaction_manager::TransactionManager;
 use crate::storage::secondary::version_manager::{EpochOp, VersionManager};
-use crate::storage::secondary::{DeleteVector, IOBackend};
+use crate::storage::secondary::{DeleteVector, IOBackend, MANIFEST_FILE_NAME};
 
 impl SecondaryStorage {
     pub(super) async fn bootstrap(options: StorageOptions) -> StorageResult<Self> {
@@ -41,7 +42,7 @@ impl SecondaryStorage {
         let mut manifest = if options.disable_all_disk_operation {
             Manifest::new_mock()
         } else {
-            Manifest::open(options.path.join("manifest.json"), enable_fsync).await?
+            Manifest::open(options.path.join(MANIFEST_FILE_NAME), enable_fsync).await?
         };
 
         let manifest_ops = manifest.replay().await?;
@@ -58,6 +59,7 @@ impl SecondaryStorage {
             compactor_handler: Mutex::new((None, None)),
             vacuum_handler: Mutex::new((None, None)),
             txn_mgr: Arc::new(TransactionManager::default()),
+            indexes: Mutex::new(InMemoryIndexes::new()),
         };
 
         info!("applying {} manifest entries", manifest_ops.len());
@@ -65,13 +67,19 @@ impl SecondaryStorage {
         let mut rowsets_to_open = HashMap::new();
         let mut dvs_to_open = HashMap::new();
 
+        let mut table_changeset = vec![];
         for op in manifest_ops {
             match op {
                 ManifestOperation::CreateTable(entry) => {
                     engine.apply_create_table(&entry)?;
+                    table_changeset.push(EpochOp::CreateTable(entry));
                 }
                 ManifestOperation::DropTable(entry) => {
                     engine.apply_drop_table(&entry)?;
+                    // TODO: actually drop table entries are not needed for a compacted manifest.
+                    // However, these are needed to restore correct `table_id`. Persist `table_id`
+                    // to manifest may solve it, and there may be other solutions.
+                    table_changeset.push(EpochOp::DropTable(entry));
                 }
                 ManifestOperation::AddRowSet(entry) => {
                     engine
@@ -161,9 +169,16 @@ impl SecondaryStorage {
             changeset.push(EpochOp::AddDV((entry, dv)));
         }
 
-        engine.version.commit_changes(changeset).await?;
-
-        // TODO: compact manifest entries
+        if options.disable_all_disk_operation {
+            engine.version.commit_changes(changeset).await?;
+        } else {
+            // Add table changeset, so that they can be reflected in compacted manifest.
+            changeset.extend(table_changeset);
+            engine
+                .version
+                .rewrite_changes(changeset, &options.path)
+                .await?;
+        }
 
         Ok(engine)
     }

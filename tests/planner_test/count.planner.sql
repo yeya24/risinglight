@@ -2,17 +2,28 @@
 explain select count(*) from t
 
 /*
-Projection: [rowcount] (cost=302.3)
-  Aggregate: [rowcount], groupby=[] (cost=301)
-    Scan: t[] (cost=0)
+Projection
+├── exprs:ref
+│   └── rowcount
+├── cost: 1.13
+├── rows: 1
+└── Agg { aggs: [ rowcount ], cost: 1.11, rows: 1 }
+    └── Scan { table: t, list: [], filter: true, cost: 0, rows: 1 }
 */
 
 -- count(*) with projection
 explain select count(*) + 1 from t
 
 /*
-Projection: [(1 + rowcount)] (cost=302.5)
-  Aggregate: [rowcount], groupby=[] (cost=301)
-    Scan: t[] (cost=0)
+Projection
+├── exprs:+
+│   ├── lhs:ref
+│   │   └── rowcount
+│   ├── rhs: 1
+
+├── cost: 1.33
+├── rows: 1
+└── Agg { aggs: [ rowcount ], cost: 1.11, rows: 1 }
+    └── Scan { table: t, list: [], filter: true, cost: 0, rows: 1 }
 */
 

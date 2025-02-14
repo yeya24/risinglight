@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -8,9 +8,11 @@ use std::str::FromStr;
 use ref_cast::RefCast;
 use serde::{Deserialize, Serialize};
 
+use super::{Vector, F64};
+
 /// Binary large object.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Serialize, Deserialize, Default)]
-pub struct Blob(Vec<u8>);
+pub struct Blob(Box<[u8]>);
 
 impl From<&[u8]> for Blob {
     fn from(bytes: &[u8]) -> Self {
@@ -20,7 +22,7 @@ impl From<&[u8]> for Blob {
 
 impl From<Vec<u8>> for Blob {
     fn from(vec: Vec<u8>) -> Self {
-        Blob(vec)
+        Blob(vec.into())
     }
 }
 
@@ -84,7 +86,7 @@ impl FromStr for Blob {
                 s = &s[1..];
             }
         }
-        Ok(Blob(v))
+        Ok(v.into())
     }
 }
 
@@ -151,6 +153,59 @@ impl fmt::Display for BlobRef {
             }
         }
         Ok(())
+    }
+}
+
+/// A slice of a vector.
+#[repr(transparent)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, RefCast, Hash)]
+pub struct VectorRef(pub(crate) [F64]);
+
+impl VectorRef {
+    pub fn new(values: &[F64]) -> &Self {
+        // SAFETY: `&VectorRef` and `&[F64]` have the same layout.
+        VectorRef::ref_cast(values)
+    }
+}
+
+impl ToOwned for VectorRef {
+    type Owned = Vector;
+
+    fn to_owned(&self) -> Self::Owned {
+        self.as_ref().into()
+    }
+}
+
+impl AsRef<[F64]> for VectorRef {
+    fn as_ref(&self) -> &[F64] {
+        &self.0
+    }
+}
+
+impl Deref for VectorRef {
+    type Target = [F64];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Debug for VectorRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.as_ref())
+    }
+}
+
+impl fmt::Display for VectorRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[")?;
+        for (i, &v) in self.as_ref().iter().enumerate() {
+            if i > 0 {
+                write!(f, ",")?;
+            }
+            write!(f, "{}", v)?;
+        }
+        write!(f, "]")
     }
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 //! RisingLight -- an educational OLAP database.
 
@@ -10,19 +10,15 @@
 #![deny(unused_must_use)]
 #![feature(array_chunks)]
 #![feature(portable_simd)]
-#![feature(generators)]
 #![feature(error_generic_member_access)]
-#![feature(provide_any)]
-#![feature(type_alias_impl_trait)]
 #![feature(stmt_expr_attributes)]
 #![feature(proc_macro_hygiene)]
-#![feature(core_intrinsics)]
 #![feature(trusted_len)]
-#![feature(once_cell)]
-#![feature(array_methods)]
+#![feature(adt_const_params)]
 #![feature(iterator_try_collect)]
-#![feature(async_fn_in_trait)]
-#![feature(return_position_impl_trait_in_trait)]
+#![feature(let_chains)]
+#![feature(impl_trait_in_assoc_type)]
+#![feature(coroutines)]
 #![allow(incomplete_features)]
 
 /// Top-level structure of the database.
@@ -32,36 +28,23 @@ pub mod db;
 pub mod parser;
 
 /// Convert the parser AST to planner AST.
-pub mod binder_v2;
+pub mod binder;
 
 /// Egg-based planner and optimizer.
 pub mod planner;
 
 /// Execute the queries.
-pub mod executor_v2;
-
-/// The legacy query engine.
-pub mod v1 {
-    /// Resolve all expressions referring with their names.
-    pub mod binder;
-
-    /// Transform the parse tree into a logical operations tree.
-    pub mod logical_planner;
-
-    /// Do query optimization.
-    pub mod optimizer;
-
-    /// Execute the queries.
-    pub mod executor;
-
-    /// Functions
-    pub mod function;
-}
+pub mod executor;
 
 /// In-memory representations of a column values.
 pub mod array;
 /// Metadata of database objects.
 pub mod catalog;
+/// Python Extension
+#[cfg(feature = "python")]
+pub mod python;
+/// Postgres wire protocol.
+pub mod server;
 /// Persistent storage engine.
 pub mod storage;
 /// Basic type definitions.

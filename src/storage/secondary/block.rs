@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 //! Secondary's Block builders and iterators
 //!
@@ -16,6 +16,8 @@ mod primitive_block_builder;
 mod primitive_block_iterator;
 mod rle_block_builder;
 mod rle_block_iterator;
+mod vector_block_builder;
+mod vector_block_iterator;
 
 use bitvec::prelude::{BitVec, Lsb0};
 pub use blob_block_builder::*;
@@ -38,6 +40,8 @@ pub use block_index_builder::*;
 use bytes::{Buf, BufMut, Bytes};
 use risinglight_proto::rowset::block_checksum::ChecksumType;
 use risinglight_proto::rowset::block_index::BlockType;
+pub use vector_block_builder::*;
+pub use vector_block_iterator::*;
 
 use super::StorageResult;
 use crate::array::Array;
@@ -168,10 +172,10 @@ impl BlockMeta {
         if buf.remaining() < 4 + 4 + 8 {
             return Err(TracedStorageError::decode("expected 16 bytes"));
         }
-        self.block_type = BlockType::from_i32(buf.get_i32())
-            .ok_or_else(|| TracedStorageError::decode("expected valid block type"))?;
-        self.checksum_type = ChecksumType::from_i32(buf.get_i32())
-            .ok_or_else(|| TracedStorageError::decode("expected valid checksum type"))?;
+        self.block_type = BlockType::try_from(buf.get_i32())
+            .map_err(|_| TracedStorageError::decode("expected valid block type"))?;
+        self.checksum_type = ChecksumType::try_from(buf.get_i32())
+            .map_err(|_| TracedStorageError::decode("expected valid checksum type"))?;
         self.checksum = buf.get_u64();
         Ok(())
     }

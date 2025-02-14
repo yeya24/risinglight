@@ -1,3 +1,5 @@
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
+
 //! Expression simplification rules and constant folding.
 
 use super::*;
@@ -71,6 +73,18 @@ pub fn rules() -> Vec<Rewrite> { vec![
     rw!("and-null";  "(and null ?a)"    => "null"),
     rw!("and-comm";  "(and ?a ?b)"      => "(and ?b ?a)"),
     rw!("and-assoc"; "(and ?a (and ?b ?c))" => "(and (and ?a ?b) ?c)"),
+    
+    rw!("and-gt-gt-fold"; "(and (>  ?x ?a) (>  ?x ?b))" => "(>  ?x ?a)" if is_greater_than_or_equal("?a", "?b")),
+    rw!("and-ge-ge-fold"; "(and (>= ?x ?a) (>= ?x ?b))" => "(>= ?x ?a)" if is_greater_than_or_equal("?a", "?b")),
+    rw!("and-gt-ge-fold"; "(and (>  ?x ?a) (>= ?x ?b))" => "(>  ?x ?a)" if is_greater_than_or_equal("?a", "?b")),
+    rw!("and-ge-gt-fold"; "(and (>= ?x ?a) (>  ?x ?b))" => "(>= ?x ?a)" if is_greater_than("?a", "?b")),
+
+    rw!("and-lt-lt-fold"; "(and (<  ?x ?a) (<  ?x ?b))" => "(<  ?x ?a)" if is_less_than_or_equal("?a", "?b")),
+    rw!("and-le-le-fold"; "(and (<= ?x ?a) (<= ?x ?b))" => "(<= ?x ?a)" if is_less_than_or_equal("?a", "?b")),
+    rw!("and-lt-le-fold"; "(and (<  ?x ?a) (<= ?x ?b))" => "(<  ?x ?a)" if is_less_than_or_equal("?a", "?b")),
+    rw!("and-le-lt-fold"; "(and (<= ?x ?a) (<  ?x ?b))" => "(<= ?x ?a)" if is_less_than("?a", "?b")),
+
+    rw!("and-gt-lt-conflict"; "(and (> ?x ?a) (< ?x ?b))" => "false" if is_greater_than_or_equal("?a", "?b")),
 
     rw!("or-false";  "(or false ?a)" => "?a"),
     rw!("or-true";   "(or true ?a)"  => "true"),
@@ -83,6 +97,30 @@ pub fn rules() -> Vec<Rewrite> { vec![
     rw!("if-not";    "(if (not ?cond) ?then ?else)" => "(if ?cond ?else ?then)"),
 
     rw!("avg";       "(avg ?a)" => "(/ (sum ?a) (count ?a))"),
+
+    // Extract Common Predicate
+    // example:
+    //            OR
+    //          /    \
+    //      AND         AND
+    //     /   \       /  \
+    // a = b   c = 1  a = b  d = 2
+    //
+    // After rule:
+    //             AND
+    //            /   \
+    //         a = b   OR
+    //                /  \
+    //            c = 1  d = 2
+    rw!("add-or-distri"; "(or (and ?a ?b) (and ?a ?c)))" => "(and ?a (or ?b ?c))"),
+]}
+
+#[rustfmt::skip]
+pub fn and_rules() -> Vec<Rewrite> { vec![
+    rw!("eq-comm";   "(=  ?a ?b)" => "(=  ?b ?a)"),
+    rw!("and-true";  "(and true ?a)"    => "?a"),
+    rw!("and-comm";  "(and ?a ?b)"      => "(and ?b ?a)"),
+    rw!("and-assoc"; "(and ?a (and ?b ?c))" => "(and (and ?a ?b) ?c)"),
 ]}
 
 /// The data type of constant analysis.
@@ -96,7 +134,7 @@ pub fn eval_constant(egraph: &EGraph, enode: &Expr) -> ConstValue {
     let x = |i: Id| egraph[i].data.constant.as_ref();
     if let Constant(v) = enode {
         Some(v.clone())
-    } else if let Nested(e) = enode {
+    } else if let Ref(e) = enode {
         Some(x(*e)?.clone())
     } else if let Some((op, a, b)) = enode.binary_op() {
         let (a, b) = (x(a)?, x(b)?);
@@ -117,10 +155,11 @@ pub fn eval_constant(egraph: &EGraph, enode: &Expr) -> ConstValue {
         Some(DataValue::Bool(x(a)?.is_null()))
     } else if let &Cast([ty, a]) = enode {
         let a = x(a)?;
-        if a.is_null() {
-            return Some(DataValue::Null);
-        }
         let ty = egraph[ty].nodes[0].as_type();
+        // don't eval cast if data type can not be kept
+        if a.is_null() && !ty.is_null() || ty.is_parametric_decimal() {
+            return None;
+        }
         // TODO: handle cast error
         a.cast(ty).ok()
     } else if let &Max(a) | &Min(a) | &Avg(a) | &First(a) | &Last(a) = enode {
@@ -145,6 +184,41 @@ fn is_not_zero(var: &str) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
     value_is(var, |v| !v.is_zero())
 }
 
+fn is_greater_than_or_equal(var1: &str, var2: &str) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
+    value_cmp(var1, var2, |d1, d2| d1.ge(d2))
+}
+
+fn is_greater_than(var1: &str, var2: &str) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
+    value_cmp(var1, var2, |d1, d2| d1.gt(d2))
+}
+
+fn is_less_than_or_equal(var1: &str, var2: &str) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
+    value_cmp(var1, var2, |d1, d2| d1.le(d2))
+}
+
+fn is_less_than(var1: &str, var2: &str) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
+    value_cmp(var1, var2, |d1, d2| d1.lt(d2))
+}
+
+fn value_cmp(
+    v1: &str,
+    v2: &str,
+    f: impl Fn(&DataValue, &DataValue) -> bool,
+) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
+    let v1 = var(v1);
+    let v2 = var(v2);
+
+    move |egraph, _, subst| match (
+        &egraph[subst[v1]].data.constant,
+        &egraph[subst[v2]].data.constant,
+    ) {
+        (Some(d1), Some(d2)) => {
+            (std::mem::discriminant(d1) == std::mem::discriminant(d2)) && f(d1, d2)
+        }
+        _ => false,
+    }
+}
+
 fn value_is(v: &str, f: impl Fn(&DataValue) -> bool) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
     let v = var(v);
     move |egraph, _, subst| {
@@ -167,7 +241,6 @@ mod tests {
     }
 
     egg::test_fn! {
-        #[cfg_attr(feature = "simd", ignore)] // FIXME: 'attempt to divide by zero'
         constant_folding,
         rules(),
         "(* (- (+ 1 2) 4) (/ 6 2))" => "-3",
@@ -183,5 +256,65 @@ mod tests {
         constant_type_cast,
         rules(),
         "(cast BOOLEAN 1)" => "true",
+    }
+
+    egg::test_fn! {
+        constant_type_isnull,
+        rules(),
+        "(isnull 1)" => "false",
+    }
+
+    egg::test_fn! {
+        constant_gt_gt_fold,
+        rules(),
+        "(and (> a 1) (> a 2))" => "(> a 2)",
+    }
+
+    egg::test_fn! {
+        constant_ge_ge_fold,
+        rules(),
+        "(and (>= a 1) (>= a 2))" => "(>= a 2)",
+    }
+
+    egg::test_fn! {
+        constant_gt_ge_fold,
+        rules(),
+        "(and (> a 2) (>= a 2))" => "(> a 2)",
+    }
+
+    egg::test_fn! {
+        constant_ge_gt_fold,
+        rules(),
+        "(and (> a 1) (>= a 2))" => "(>= a 2)",
+    }
+
+    egg::test_fn! {
+        constant_lt_lt_fold,
+        rules(),
+        "(and (< a 1) (< a 2))" => "(< a 1)",
+    }
+
+    egg::test_fn! {
+        constant_le_le_fold,
+        rules(),
+        "(and (<= a 1) (<= a 2))" => "(<= a 1)",
+    }
+
+    egg::test_fn! {
+        constant_lt_le_fold,
+        rules(),
+        "(and (< a 2) (<= a 2))" => "(< a 2)",
+    }
+
+    egg::test_fn! {
+        constant_le_lt_fold,
+        rules(),
+        "(and (< a 2) (<= a 1))" => "(<= a 1)",
+    }
+
+    egg::test_fn! {
+        constant_gt_lt_conflict,
+        rules(),
+        "(and (> a 2) (< a 2))" => "false",
     }
 }

@@ -1,7 +1,7 @@
 [package]
 edition = "2021"
 name = "risinglight"
-version = "0.2.0-alpha"
+version = "0.2.0"
 description = "An OLAP database system for educational purpose"
 license = "Apache-2.0"
 readme = "README.md"
@@ -13,62 +13,89 @@ keywords = ["sql", "database", "embedded", "cli"]
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
+python = ["pyo3", "pyo3-build-config"]
 
 [dependencies]
+ahash = "0.8"
 anyhow = "1"
+async-broadcast = "0.7"
 async-recursion = "1"
 async-stream = "0.3"
 async-trait = "0.1"
 binary-heap-plus = "0.5"
-bit-set = "0.5"
+bit-set = "0.8"
 bitvec = { version = "1", features = ["serde"] }
 btreemultimap = "0.1"
 bytes = "1"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["clock", "std", "wasmbind"] }
 clap = { version = "4", features = ["derive"] }
-comfy-table = { version = "6", default-features = false }
-console-subscriber = "0.1"
+comfy-table = { version = "7", default-features = false }
+console-subscriber = "0.4"
 crc32fast = "1"
 csv = "1"
-dirs = "4"
+dirs = "5"
 downcast-rs = "1"
-egg = "0.9"
+egg = { version = "0.9.5", features = ["deterministic"] }
 enum_dispatch = "0.3"
-erased-serde = "0.3"
+erased-serde = "0.4"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 futures-async-stream = "0.2"
 humantime = "2"
 indicatif = "0.17"
-indoc = "1"
-iter-chunks = "0.1"
-itertools = "0.10"
-minitrace = "0.4.0"
-moka = { version = "0.9", features = ["future"] }
+indoc = "2"
+iter-chunks = "0.2"
+itertools = "0.13"
+minitrace = { version = "0.6", features = ["enable"] }
+moka = { version = "0.12", features = ["future"] }
 num-traits = "0.2"
-ordered-float = { version = "3", features = ["serde"] }
+ordered-float = { version = "4", features = ["serde"] }
 parking_lot = "0.12"
-parse-display = "0.6"
+parse-display = "0.10"
 paste = "1"
-prost = "0.11.0"
+pgwire = "0.20"
+pin-project = "1"
+pretty-xmlish = "0.1"
+prost = "0.13"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 ref-cast = "1.0"
-risinglight_proto = "0.1"
+regex = "1"
+risinglight_proto = "0.2"
 rust_decimal = "1"
-rustyline = "10"
+rustyline = "15"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 smallvec = { version = "1", features = ["serde"] }
-sqllogictest = "0.9"
-sqlparser = { version = "0.27", features = ["serde"] }
-thiserror = "1"
-tikv-jemallocator = { version = "0.5", optional = true }
+sqllogictest = "0.23"
+sqlparser = { version = "0.53", features = ["serde"] }
+thiserror = "2"
+tikv-jemallocator = { version = "0.6", optional = true, features = [
+    "disable_initial_exec_tls",
+] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "parking_lot"] }
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "parking_lot",
+] }
 
 [dev-dependencies]
-criterion = { version = "0.4", features = ["async_tokio"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+glob = "0.3"
+libtest-mimic = "0.8"
+sqlplannertest = "0.2"
 tempfile = "3"
-test-case = "2"
+test-case = "3"
+
+[build-dependencies]
+pyo3-build-config = { version = "0.22", optional = true }
+
+[[test]]
+name = "sqllogictest"
+harness = false
+
+[[test]]
+name = "sqlplannertest"
+harness = false
 
 [[bench]]
 harness = false
@@ -78,16 +105,19 @@ name = "e2e"
 harness = false
 name = "array"
 
-[profile.bench]
-codegen-units = 1
-lto = 'thin'
+[[bench]]
+harness = false
+name = "tpch"
 
 [workspace]
-members = [
-  "proto",
-  "tests/sqllogictest",
-  "tests/sqlplannertest"
-]
+members = ["proto"]
 
 [patch.crates-io]
 risinglight_proto = { path = "proto" }
+
+[lib]
+name = "risinglight"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+debug = true

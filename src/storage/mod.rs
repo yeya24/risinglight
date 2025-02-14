@@ -1,4 +1,4 @@
-// Copyright 2022 RisingLight Project Authors. Licensed under Apache-2.0.
+// Copyright 2024 RisingLight Project Authors. Licensed under Apache-2.0.
 
 //! Traits and basic data structures for RisingLight's all storage engines.
 
@@ -8,20 +8,27 @@ pub use memory::InMemoryStorage;
 mod secondary;
 pub use secondary::{SecondaryStorage, StorageOptions as SecondaryStorageOptions};
 
+mod index;
+pub use index::InMemoryIndex;
+
 mod error;
 pub use error::{StorageError, StorageResult, TracedStorageError};
+use serde::Serialize;
 
 mod chunk;
 use std::future::Future;
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 pub use chunk::*;
 use enum_dispatch::enum_dispatch;
 
 use crate::array::{ArrayImpl, DataChunk};
-use crate::catalog::{ColumnCatalog, ColumnId, DatabaseId, SchemaId, TableRefId};
+use crate::binder::IndexType;
+use crate::catalog::{
+    ColumnCatalog, ColumnId, IndexId, RootCatalog, SchemaId, TableId, TableRefId,
+};
 use crate::types::DataValue;
-use crate::v1::binder::BoundExpr;
 
 #[enum_dispatch(StorageDispatch)]
 #[derive(Clone)]
@@ -44,7 +51,16 @@ impl StorageImpl {
 }
 
 impl StorageImpl {
-    pub fn enable_filter_scan(&self) -> bool {
+    /// Returns true if the storage engine supports range filter scan.
+    pub fn support_range_filter_scan(&self) -> bool {
+        match self {
+            Self::SecondaryStorage(_) => true,
+            Self::InMemoryStorage(_) => false,
+        }
+    }
+
+    /// Returns true if scanned table is sorted by primary key.
+    pub fn table_is_sorted_by_primary_key(&self) -> bool {
         match self {
             Self::SecondaryStorage(_) => true,
             Self::InMemoryStorage(_) => false,
@@ -60,21 +76,40 @@ pub trait Storage: Sync + Send + 'static {
     /// Type of the table belonging to this storage engine.
     type Table: Table<Transaction = Self::Transaction>;
 
-    fn create_table<'a>(
-        &'a self,
-        database_id: DatabaseId,
+    fn create_table(
+        &self,
         schema_id: SchemaId,
-        table_name: &'a str,
-        column_descs: &'a [ColumnCatalog],
-        ordered_pk_ids: &'a [ColumnId],
-    ) -> impl Future<Output = StorageResult<()>> + Send + 'a;
+        table_name: &str,
+        column_descs: &[ColumnCatalog],
+        ordered_pk_ids: &[ColumnId],
+    ) -> impl Future<Output = StorageResult<()>> + Send;
 
     fn get_table(&self, table_id: TableRefId) -> StorageResult<Self::Table>;
 
-    fn drop_table(
+    fn drop_table(&self, table_id: TableRefId) -> impl Future<Output = StorageResult<()>> + Send;
+
+    fn create_index(
         &self,
-        table_id: TableRefId,
-    ) -> impl Future<Output = StorageResult<()>> + Send + '_;
+        schema_id: SchemaId,
+        index_name: &str,
+        table_id: TableId,
+        column_idxs: &[ColumnId],
+        index_type: &IndexType,
+    ) -> impl Future<Output = StorageResult<IndexId>> + Send;
+
+    /// Get the catalog of the storage engine.
+    ///
+    /// TODO: users should not be able to modify the catalog.
+    fn get_catalog(&self) -> Arc<RootCatalog>;
+
+    fn get_index(
+        &self,
+        schema_id: SchemaId,
+        index_id: IndexId,
+    ) -> impl Future<Output = StorageResult<Arc<dyn InMemoryIndex>>> + Send;
+
+    // XXX: remove this
+    fn as_disk(&self) -> Option<&SecondaryStorage>;
 }
 
 /// A table in the storage engine. [`Table`] is by default a reference to a table,
@@ -97,6 +132,9 @@ pub trait Table: Sync + Send + Clone + 'static {
 
     /// Get table id
     fn table_id(&self) -> TableRefId;
+
+    /// Get primary key
+    fn ordered_pk_ids(&self) -> Vec<ColumnId>;
 }
 
 /// Reference to a column.
@@ -127,32 +165,90 @@ pub trait Transaction: Sync + Send + 'static {
     type RowHandlerType: RowHandler;
 
     /// Scan one or multiple columns.
-    fn scan<'a>(
-        &'a self,
-        begin_sort_key: &'a [DataValue],
-        end_sort_key: &'a [DataValue],
-        col_idx: &'a [StorageColumnRef],
-        is_sorted: bool,
-        reversed: bool,
-        expr: Option<BoundExpr>,
-    ) -> impl Future<Output = StorageResult<Self::TxnIteratorType>> + Send + 'a;
+    fn scan(
+        &self,
+        col_idx: &[StorageColumnRef],
+        options: ScanOptions,
+    ) -> impl Future<Output = StorageResult<Self::TxnIteratorType>> + Send;
 
     /// Append data to the table. Generally, `columns` should be in the same order as
     /// [`ColumnCatalog`] when constructing the [`Table`].
-    fn append(&mut self, columns: DataChunk)
-        -> impl Future<Output = StorageResult<()>> + Send + '_;
+    fn append(&mut self, columns: DataChunk) -> impl Future<Output = StorageResult<()>> + Send;
 
     /// Delete a record.
-    fn delete<'a>(
-        &'a mut self,
-        id: &'a Self::RowHandlerType,
-    ) -> impl Future<Output = StorageResult<()>> + Send + 'a;
+    fn delete(
+        &mut self,
+        id: &Self::RowHandlerType,
+    ) -> impl Future<Output = StorageResult<()>> + Send;
 
     /// Commit a transaction.
     fn commit(self) -> impl Future<Output = StorageResult<()>> + Send;
 
     /// Abort a transaction.
     fn abort(self) -> impl Future<Output = StorageResult<()>> + Send;
+}
+
+/// Options for scanning.
+#[derive(Debug, Default)]
+pub struct ScanOptions {
+    is_sorted: bool,
+    reversed: bool,
+    filter: Option<KeyRange>,
+}
+
+impl ScanOptions {
+    /// Scan with filter.
+    pub fn with_filter_opt(mut self, filter: Option<KeyRange>) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    pub fn with_sorted(mut self, sorted: bool) -> Self {
+        self.is_sorted = sorted;
+        self
+    }
+}
+
+/// A range of keys.
+///
+/// # Example
+/// ```text
+/// // key > 1
+/// KeyRange {
+///     start: Bound::Excluded(DataValue::Int64(Some(1))),
+///     end: Bound::Unbounded,
+/// }
+///
+/// // key = 0
+/// KeyRange {
+///     start: Bound::Included(DataValue::Int64(Some(0))),
+///     end: Bound::Included(DataValue::Int64(Some(0))),
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyRange {
+    /// Start bound.
+    pub start: Bound<DataValue>,
+    /// End bound.
+    pub end: Bound<DataValue>,
+}
+
+impl RangeBounds<DataValue> for KeyRange {
+    fn start_bound(&self) -> Bound<&DataValue> {
+        match &self.start {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(v) => Bound::Included(v),
+            Bound::Excluded(v) => Bound::Excluded(v),
+        }
+    }
+
+    fn end_bound(&self) -> Bound<&DataValue> {
+        match &self.end {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(v) => Bound::Included(v),
+            Bound::Excluded(v) => Bound::Excluded(v),
+        }
+    }
 }
 
 /// An iterator over table in a transaction.
